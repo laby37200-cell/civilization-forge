@@ -185,7 +185,7 @@ export type InsertCity = z.infer<typeof insertCitySchema>;
 export type City = typeof cities.$inferSelect;
 
 // === TURN ACTIONS ===
-export type ActionType = "move" | "attack" | "build" | "recruit" | "trade" | "defense" | "civil_war";
+export type ActionType = "move" | "attack" | "build" | "recruit" | "trade" | "tax" | "defense" | "civil_war";
 
 export const turnActions = pgTable("turn_actions", {
   id: serial("id").primaryKey(),
@@ -286,6 +286,10 @@ export const trades = pgTable("trades", {
   offerSpecialtyAmount: integer("offer_specialty_amount").default(0),
   offerUnitType: text("offer_unit_type").$type<UnitTypeDB>(),
   offerUnitAmount: integer("offer_unit_amount").default(0),
+  offerPeaceTreaty: boolean("offer_peace_treaty").default(false),
+  offerShareVision: boolean("offer_share_vision").default(false),
+  offerCityId: integer("offer_city_id").references(() => cities.id),
+  offerSpyId: integer("offer_spy_id"),
   // 응답자 품목
   requestGold: integer("request_gold").default(0),
   requestFood: integer("request_food").default(0),
@@ -293,12 +297,28 @@ export const trades = pgTable("trades", {
   requestSpecialtyAmount: integer("request_specialty_amount").default(0),
   requestUnitType: text("request_unit_type").$type<UnitTypeDB>(),
   requestUnitAmount: integer("request_unit_amount").default(0),
+  requestPeaceTreaty: boolean("request_peace_treaty").default(false),
+  requestShareVision: boolean("request_share_vision").default(false),
+  requestCityId: integer("request_city_id").references(() => cities.id),
+  requestSpyId: integer("request_spy_id"),
   // 기타
   proposedTurn: integer("proposed_turn").notNull(),
   resolvedTurn: integer("resolved_turn"),
 });
 
 export type Trade = typeof trades.$inferSelect;
+
+// === 시야 공유 (거래/외교로 획득) VISION SHARES ===
+export const visionShares = pgTable("vision_shares", {
+  id: serial("id").primaryKey(),
+  gameId: integer("game_id").references(() => gameRooms.id),
+  granterId: integer("granter_id").references(() => gamePlayers.id),
+  granteeId: integer("grantee_id").references(() => gamePlayers.id),
+  createdTurn: integer("created_turn").notNull().default(0),
+  revokedTurn: integer("revoked_turn"),
+});
+
+export type VisionShare = typeof visionShares.$inferSelect;
 
 // === 첩보 시스템 SPIES ===
 export type SpyLocationType = "tile" | "city";

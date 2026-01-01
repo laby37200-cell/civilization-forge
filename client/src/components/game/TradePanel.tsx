@@ -15,17 +15,20 @@ import { ScrollArea } from "@/components/ui/scroll-area";
 import { apiRequest } from "@/lib/queryClient";
 import { useToast } from "@/hooks/use-toast";
 import { SpecialtyStats } from "@shared/schema";
-import type { Trade, TradeStatus, GamePlayer, SpecialtyType, UnitTypeDB } from "@shared/schema";
+import type { Trade, TradeStatus, GamePlayer, SpecialtyType, UnitTypeDB, City, Spy } from "@shared/schema";
+import { Checkbox } from "@/components/ui/checkbox";
 
 interface TradePanelProps {
   roomId: number;
   currentPlayerId: number;
   players: GamePlayer[];
+  cities: City[];
+  spies: Spy[];
   myGold: number;
   myFood: number;
 }
 
-export function TradePanel({ roomId, currentPlayerId, players, myGold, myFood }: TradePanelProps) {
+export function TradePanel({ roomId, currentPlayerId, players, cities, spies, myGold, myFood }: TradePanelProps) {
   const [trades, setTrades] = useState<Trade[]>([]);
   const [roomTurn, setRoomTurn] = useState<number>(1);
   const [tradeExpireAfterTurns, setTradeExpireAfterTurns] = useState<number>(3);
@@ -41,6 +44,10 @@ export function TradePanel({ roomId, currentPlayerId, players, myGold, myFood }:
   const [counterOfferSpecialtyAmount, setCounterOfferSpecialtyAmount] = useState(0);
   const [counterOfferUnitType, setCounterOfferUnitType] = useState<UnitTypeDB | "">("");
   const [counterOfferUnitAmount, setCounterOfferUnitAmount] = useState(0);
+  const [counterOfferPeaceTreaty, setCounterOfferPeaceTreaty] = useState(false);
+  const [counterOfferShareVision, setCounterOfferShareVision] = useState(false);
+  const [counterOfferCityId, setCounterOfferCityId] = useState<number | null>(null);
+  const [counterOfferSpyId, setCounterOfferSpyId] = useState<number | null>(null);
 
   const [proposeTargetId, setProposeTargetId] = useState<number | null>(null);
   const [offerGold, setOfferGold] = useState(0);
@@ -49,12 +56,20 @@ export function TradePanel({ roomId, currentPlayerId, players, myGold, myFood }:
   const [offerSpecialtyAmount, setOfferSpecialtyAmount] = useState(0);
   const [offerUnitType, setOfferUnitType] = useState<UnitTypeDB | "">("");
   const [offerUnitAmount, setOfferUnitAmount] = useState(0);
+  const [offerPeaceTreaty, setOfferPeaceTreaty] = useState(false);
+  const [offerShareVision, setOfferShareVision] = useState(false);
+  const [offerCityId, setOfferCityId] = useState<number | null>(null);
+  const [offerSpyId, setOfferSpyId] = useState<number | null>(null);
   const [requestGold, setRequestGold] = useState(0);
   const [requestFood, setRequestFood] = useState(0);
   const [requestSpecialtyType, setRequestSpecialtyType] = useState<SpecialtyType | "">("");
   const [requestSpecialtyAmount, setRequestSpecialtyAmount] = useState(0);
   const [requestUnitType, setRequestUnitType] = useState<UnitTypeDB | "">("");
   const [requestUnitAmount, setRequestUnitAmount] = useState(0);
+  const [requestPeaceTreaty, setRequestPeaceTreaty] = useState(false);
+  const [requestShareVision, setRequestShareVision] = useState(false);
+  const [requestCityId, setRequestCityId] = useState<number | null>(null);
+  const [requestSpyId, setRequestSpyId] = useState<number | null>(null);
   const { toast } = useToast();
 
   const NONE_VALUE = "__none__";
@@ -143,8 +158,12 @@ export function TradePanel({ roomId, currentPlayerId, players, myGold, myFood }:
       (offerGold === 0 && offerFood === 0 && offerSpecialtyAmount === 0 && offerUnitAmount === 0) ||
       (requestGold === 0 && requestFood === 0 && requestSpecialtyAmount === 0 && requestUnitAmount === 0)
     ) {
-      toast({ title: "제안과 요청에 자원을 넣어주세요", variant: "destructive" });
-      return;
+      const offerHasExtra = Boolean(offerPeaceTreaty || offerShareVision || offerCityId != null || offerSpyId != null);
+      const requestHasExtra = Boolean(requestPeaceTreaty || requestShareVision || requestCityId != null || requestSpyId != null);
+      if (!offerHasExtra || !requestHasExtra) {
+        toast({ title: "제안과 요청에 자원을 넣어주세요", variant: "destructive" });
+        return;
+      }
     }
 
     try {
@@ -157,6 +176,10 @@ export function TradePanel({ roomId, currentPlayerId, players, myGold, myFood }:
           specialtyAmount: offerSpecialtyAmount,
           unitType: offerUnitType || undefined,
           unitAmount: offerUnitAmount,
+          peaceTreaty: offerPeaceTreaty,
+          shareVision: offerShareVision,
+          cityId: offerCityId ?? undefined,
+          spyId: offerSpyId ?? undefined,
         },
         request: {
           gold: requestGold,
@@ -165,6 +188,10 @@ export function TradePanel({ roomId, currentPlayerId, players, myGold, myFood }:
           specialtyAmount: requestSpecialtyAmount,
           unitType: requestUnitType || undefined,
           unitAmount: requestUnitAmount,
+          peaceTreaty: requestPeaceTreaty,
+          shareVision: requestShareVision,
+          cityId: requestCityId ?? undefined,
+          spyId: requestSpyId ?? undefined,
         },
       });
       toast({ title: "거래 제안을 보냈습니다" });
@@ -176,12 +203,20 @@ export function TradePanel({ roomId, currentPlayerId, players, myGold, myFood }:
       setOfferSpecialtyAmount(0);
       setOfferUnitType("");
       setOfferUnitAmount(0);
+      setOfferPeaceTreaty(false);
+      setOfferShareVision(false);
+      setOfferCityId(null);
+      setOfferSpyId(null);
       setRequestGold(0);
       setRequestFood(0);
       setRequestSpecialtyType("");
       setRequestSpecialtyAmount(0);
       setRequestUnitType("");
       setRequestUnitAmount(0);
+      setRequestPeaceTreaty(false);
+      setRequestShareVision(false);
+      setRequestCityId(null);
+      setRequestSpyId(null);
       await fetchTrades();
     } catch (e: any) {
       toast({ title: "제안 실패", description: e.message, variant: "destructive" });
@@ -206,6 +241,10 @@ export function TradePanel({ roomId, currentPlayerId, players, myGold, myFood }:
     setCounterOfferSpecialtyAmount(0);
     setCounterOfferUnitType("");
     setCounterOfferUnitAmount(0);
+    setCounterOfferPeaceTreaty(false);
+    setCounterOfferShareVision(false);
+    setCounterOfferCityId(null);
+    setCounterOfferSpyId(null);
   };
 
   const submitCounter = async (t: Trade) => {
@@ -231,8 +270,11 @@ export function TradePanel({ roomId, currentPlayerId, players, myGold, myFood }:
     }
 
     if (counterOfferGold === 0 && counterOfferFood === 0 && counterOfferSpecialtyAmount === 0 && counterOfferUnitAmount === 0) {
-      toast({ title: "역제안할 내용을 입력해주세요", variant: "destructive" });
-      return;
+      const hasExtra = Boolean(counterOfferPeaceTreaty || counterOfferShareVision || counterOfferCityId != null || counterOfferSpyId != null);
+      if (!hasExtra) {
+        toast({ title: "역제안할 내용을 입력해주세요", variant: "destructive" });
+        return;
+      }
     }
 
     try {
@@ -245,6 +287,10 @@ export function TradePanel({ roomId, currentPlayerId, players, myGold, myFood }:
           specialtyAmount: counterOfferSpecialtyAmount,
           unitType: counterOfferUnitType || undefined,
           unitAmount: counterOfferUnitAmount,
+          peaceTreaty: counterOfferPeaceTreaty,
+          shareVision: counterOfferShareVision,
+          cityId: counterOfferCityId ?? undefined,
+          spyId: counterOfferSpyId ?? undefined,
         },
       });
       toast({ title: "역제안을 보냈습니다" });
@@ -282,6 +328,29 @@ export function TradePanel({ roomId, currentPlayerId, players, myGold, myFood }:
   const otherPlayers = players.filter((p) => p.id !== currentPlayerId && !p.isEliminated);
 
   const playerLabel = (p: GamePlayer) => p.nationId || `Player ${p.id}`;
+
+  const myCities = useMemo(() => cities.filter((c) => c.ownerId === currentPlayerId), [cities, currentPlayerId]);
+  const targetCities = useMemo(() => (proposeTargetId != null ? cities.filter((c) => c.ownerId === proposeTargetId) : []), [cities, proposeTargetId]);
+  const mySpies = useMemo(() => spies.filter((s) => s.playerId === currentPlayerId && s.isAlive), [spies, currentPlayerId]);
+  const targetSpies = useMemo(() => (proposeTargetId != null ? spies.filter((s) => s.playerId === proposeTargetId && s.isAlive) : []), [spies, proposeTargetId]);
+
+  const cityLabelById = useMemo(() => {
+    const m = new Map<number, string>();
+    for (const c of cities) {
+      if (c.id == null) continue;
+      m.set(c.id, c.nameKo ?? c.name ?? `City ${c.id}`);
+    }
+    return m;
+  }, [cities]);
+
+  const spyLabelById = useMemo(() => {
+    const m = new Map<number, string>();
+    for (const s of spies) {
+      if (s.id == null) continue;
+      m.set(s.id, `Spy #${s.id} (Lv ${s.level ?? 1})`);
+    }
+    return m;
+  }, [spies]);
 
   const filteredTrades = useMemo(() => {
     return trades.filter((t) => {
@@ -379,6 +448,48 @@ export function TradePanel({ roomId, currentPlayerId, players, myGold, myFood }:
             <div>
               <Label>제안 병력 수량</Label>
               <Input type="number" min={0} value={offerUnitAmount} onChange={(e) => setOfferUnitAmount(Number(e.target.value))} />
+            </div>
+          </div>
+
+          <div className="grid grid-cols-2 gap-4">
+            <div className="flex items-center gap-2">
+              <Checkbox checked={offerPeaceTreaty} onCheckedChange={(v) => setOfferPeaceTreaty(Boolean(v))} />
+              <Label>평화/휴전 제안</Label>
+            </div>
+            <div className="flex items-center gap-2">
+              <Checkbox checked={offerShareVision} onCheckedChange={(v) => setOfferShareVision(Boolean(v))} />
+              <Label>시야 공유 제공</Label>
+            </div>
+          </div>
+
+          <div className="grid grid-cols-2 gap-4">
+            <div>
+              <Label>제안할 도시</Label>
+              <Select value={offerCityId != null ? String(offerCityId) : NONE_VALUE} onValueChange={(v) => setOfferCityId(v === NONE_VALUE ? null : Number(v))}>
+                <SelectTrigger>
+                  <SelectValue placeholder="선택 안함" />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value={NONE_VALUE}>선택 안함</SelectItem>
+                  {myCities.map((c) => (
+                    <SelectItem key={c.id} value={String(c.id)}>{c.nameKo ?? c.name ?? `City ${c.id}`}</SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+            </div>
+            <div>
+              <Label>제안할 스파이</Label>
+              <Select value={offerSpyId != null ? String(offerSpyId) : NONE_VALUE} onValueChange={(v) => setOfferSpyId(v === NONE_VALUE ? null : Number(v))}>
+                <SelectTrigger>
+                  <SelectValue placeholder="선택 안함" />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value={NONE_VALUE}>선택 안함</SelectItem>
+                  {mySpies.map((s) => (
+                    <SelectItem key={s.id} value={String(s.id)}>{`Spy #${s.id} (Lv ${s.level ?? 1})`}</SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
             </div>
           </div>
 
@@ -516,6 +627,10 @@ export function TradePanel({ roomId, currentPlayerId, players, myGold, myFood }:
                       {(t.offerUnitType || (t.offerUnitAmount ?? 0) > 0) && (
                         <div>제안: 병력 {t.offerUnitType ? (unitTypeLabels[t.offerUnitType as UnitTypeDB] ?? t.offerUnitType) : "-"} / 수량 {t.offerUnitAmount ?? 0}</div>
                       )}
+                      {(t as any).offerPeaceTreaty ? <div>제안: 평화/휴전</div> : null}
+                      {(t as any).offerShareVision ? <div>제안: 시야 공유</div> : null}
+                      {(t as any).offerCityId ? <div>제안: 도시 {cityLabelById.get(Number((t as any).offerCityId)) ?? `#${String((t as any).offerCityId)}`}</div> : null}
+                      {(t as any).offerSpyId ? <div>제안: 스파이 {spyLabelById.get(Number((t as any).offerSpyId)) ?? `#${String((t as any).offerSpyId)}`}</div> : null}
                       <div>요청: 금 {t.requestGold} / 식량 {t.requestFood}</div>
                       {(t.requestSpecialtyType || (t.requestSpecialtyAmount ?? 0) > 0) && (
                         <div>요청: 특산물 {t.requestSpecialtyType ? SpecialtyStats[t.requestSpecialtyType as SpecialtyType]?.nameKo ?? t.requestSpecialtyType : "-"} / 수량 {t.requestSpecialtyAmount ?? 0}</div>
@@ -523,6 +638,10 @@ export function TradePanel({ roomId, currentPlayerId, players, myGold, myFood }:
                       {(t.requestUnitType || (t.requestUnitAmount ?? 0) > 0) && (
                         <div>요청: 병력 {t.requestUnitType ? (unitTypeLabels[t.requestUnitType as UnitTypeDB] ?? t.requestUnitType) : "-"} / 수량 {t.requestUnitAmount ?? 0}</div>
                       )}
+                      {(t as any).requestPeaceTreaty ? <div>요청: 평화/휴전</div> : null}
+                      {(t as any).requestShareVision ? <div>요청: 시야 공유</div> : null}
+                      {(t as any).requestCityId ? <div>요청: 도시 {cityLabelById.get(Number((t as any).requestCityId)) ?? `#${String((t as any).requestCityId)}`}</div> : null}
+                      {(t as any).requestSpyId ? <div>요청: 스파이 {spyLabelById.get(Number((t as any).requestSpyId)) ?? `#${String((t as any).requestSpyId)}`}</div> : null}
                     </div>
 
                     {canRespond && (
@@ -593,6 +712,48 @@ export function TradePanel({ roomId, currentPlayerId, players, myGold, myFood }:
                           <div>
                             <Label>병력 수량</Label>
                             <Input type="number" min={0} value={counterOfferUnitAmount} onChange={(e) => setCounterOfferUnitAmount(Number(e.target.value))} />
+                          </div>
+                        </div>
+
+                        <div className="grid grid-cols-2 gap-3">
+                          <div className="flex items-center gap-2">
+                            <Checkbox checked={counterOfferPeaceTreaty} onCheckedChange={(v) => setCounterOfferPeaceTreaty(Boolean(v))} />
+                            <Label>평화/휴전 제안</Label>
+                          </div>
+                          <div className="flex items-center gap-2">
+                            <Checkbox checked={counterOfferShareVision} onCheckedChange={(v) => setCounterOfferShareVision(Boolean(v))} />
+                            <Label>시야 공유 제공</Label>
+                          </div>
+                        </div>
+
+                        <div className="grid grid-cols-2 gap-3">
+                          <div>
+                            <Label>제안할 도시</Label>
+                            <Select value={counterOfferCityId != null ? String(counterOfferCityId) : NONE_VALUE} onValueChange={(v) => setCounterOfferCityId(v === NONE_VALUE ? null : Number(v))}>
+                              <SelectTrigger>
+                                <SelectValue placeholder="선택 안함" />
+                              </SelectTrigger>
+                              <SelectContent>
+                                <SelectItem value={NONE_VALUE}>선택 안함</SelectItem>
+                                {myCities.map((c) => (
+                                  <SelectItem key={c.id} value={String(c.id)}>{c.nameKo ?? c.name ?? `City ${c.id}`}</SelectItem>
+                                ))}
+                              </SelectContent>
+                            </Select>
+                          </div>
+                          <div>
+                            <Label>제안할 스파이</Label>
+                            <Select value={counterOfferSpyId != null ? String(counterOfferSpyId) : NONE_VALUE} onValueChange={(v) => setCounterOfferSpyId(v === NONE_VALUE ? null : Number(v))}>
+                              <SelectTrigger>
+                                <SelectValue placeholder="선택 안함" />
+                              </SelectTrigger>
+                              <SelectContent>
+                                <SelectItem value={NONE_VALUE}>선택 안함</SelectItem>
+                                {mySpies.map((s) => (
+                                  <SelectItem key={s.id} value={String(s.id)}>{`Spy #${s.id} (Lv ${s.level ?? 1})`}</SelectItem>
+                                ))}
+                              </SelectContent>
+                            </Select>
                           </div>
                         </div>
 

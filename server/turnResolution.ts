@@ -19,8 +19,7 @@ import {
   battlefields,
   battlefieldParticipants,
   battlefieldActions,
-  engagements,
-  engagementActions,
+  visionShares,
   CityGradeStats,
   UnitStats,
   TerrainStats,
@@ -38,7 +37,7 @@ import {
   type SpyMission,
   type SpyLocationType,
   type NewsVisibilityDB,
-  type EngagementActionTypeDB
+  
 } from "@shared/schema";
 import { eq, and, sql, gt, lt, or, ne, inArray, isNotNull, isNull } from "drizzle-orm";
 import { generateNewsNarrative, judgeBattle } from "./llm";
@@ -312,36 +311,6 @@ async function getRelationFlags(gameId: number, a: number, b: number): Promise<{
   const friendly = status === "alliance";
   const atWar = status === "war";
   return { friendly, atWar };
-}
-
-async function upsertEngagement(params: {
-  gameId: number;
-  tileId: number;
-  attackerId: number;
-  defenderId: number;
-  attackerFromTileId: number;
-  turn: number;
-}): Promise<void> {
-  const [existing] = await db
-    .select({ id: engagements.id, attackerId: engagements.attackerId, defenderId: engagements.defenderId, state: engagements.state })
-    .from(engagements)
-    .where(and(eq(engagements.gameId, params.gameId), eq(engagements.tileId, params.tileId), ne(engagements.state, "resolved" as any)))
-    .limit(1);
-
-  if (existing) {
-    return;
-  }
-
-  await db.insert(engagements).values({
-    gameId: params.gameId,
-    tileId: params.tileId,
-    attackerId: params.attackerId,
-    defenderId: params.defenderId,
-    attackerFromTileId: params.attackerFromTileId,
-    startedTurn: params.turn,
-    lastResolvedTurn: 0,
-    state: "engaged" as any,
-  });
 }
 
 async function upsertBattlefield(params: {
@@ -832,6 +801,16 @@ async function recomputeFogOfWar(gameId: number) {
     alliedTo.get(a.p2)!.add(a.p1);
   }
 
+  const shareRows = await db
+    .select({ granterId: visionShares.granterId, granteeId: visionShares.granteeId })
+    .from(visionShares)
+    .where(and(eq(visionShares.gameId, gameId), isNull(visionShares.revokedTurn)));
+  for (const s of shareRows) {
+    if (!s.granterId || !s.granteeId) continue;
+    if (!alliedTo.has(s.granterId)) alliedTo.set(s.granterId, new Set());
+    alliedTo.get(s.granterId)!.add(s.granteeId);
+  }
+
   const unitTiles = await db
     .select({ ownerId: units.ownerId, tileId: units.tileId })
     .from(units)
@@ -1199,12 +1178,13 @@ export async function runActionsPhase(gameId: number, turn: number): Promise<Tur
   const buildActions = actions.filter((a) => a.actionType === "build");
   const recruitActions = actions.filter((a) => a.actionType === "recruit");
   const tradeActions = actions.filter((a) => a.actionType === "trade");
+  const taxActions = actions.filter((a) => a.actionType === "tax");
 
   for (const action of attackActions) {
     try {
       // 교전 시스템(v1): attack 액션은 즉시 승패를 내지 않고
       // 1) 병력을 타일로 이동(겹치면 교전 생성)
-      // 2) 실제 손실/결과는 resolution phase에서 engagements로 처리
+      // 2) 실제 손실/결과는 resolution phase에서 battlefields로 처리
       const d = (action.data ?? {}) as any;
       const fromTileId = typeof d.fromTileId === "number" ? d.fromTileId : null;
       const targetTileId = typeof d.targetTileId === "number" ? d.targetTileId : null;
@@ -1245,6 +1225,14 @@ export async function runActionsPhase(gameId: number, turn: number): Promise<Tur
       await processRecruit(action);
     } catch (e) {
       console.error("[TurnResolution] Recruit processing error:", e);
+    }
+  }
+
+  for (const action of taxActions) {
+    try {
+      await processTax(action);
+    } catch (e) {
+      console.error("[TurnResolution] Tax processing error:", e);
     }
   }
 
@@ -1337,132 +1325,6 @@ export async function runResolutionPhase(gameId: number, turn: number): Promise<
   const battlefieldNews = await resolveBattlefields(gameId, turn);
   news.push(...battlefieldNews);
 
-  const activeEngagements = await db
-    .select()
-    .from(engagements)
-    .where(and(eq(engagements.gameId, gameId), ne(engagements.state, "resolved" as any), lt(engagements.lastResolvedTurn, turn)));
-
-  for (const eng of activeEngagements) {
-    const tileId = eng.tileId;
-    const attackerId = eng.attackerId;
-    const defenderId = eng.defenderId;
-    const attackerFromTileId = eng.attackerFromTileId;
-    if (!tileId || !attackerId || !defenderId || !attackerFromTileId) continue;
-
-    const attackerTroops = await getTileTroops(gameId, tileId, attackerId);
-    const defenderTroops = await getTileTroops(gameId, tileId, defenderId);
-
-    const attackerSum = sumTroops({ ...attackerTroops, spy: 0 });
-    const defenderSum = sumTroops({ ...defenderTroops, spy: 0 });
-
-    if (attackerSum <= 0 || defenderSum <= 0) {
-      await db
-        .update(engagements)
-        .set({ state: "resolved" as any, lastResolvedTurn: turn })
-        .where(eq(engagements.id, eng.id));
-      continue;
-    }
-
-    const actionRows = await db
-      .select({ playerId: engagementActions.playerId, actionType: engagementActions.actionType })
-      .from(engagementActions)
-      .where(and(eq(engagementActions.gameId, gameId), eq(engagementActions.engagementId, eng.id), eq(engagementActions.turn, turn), eq(engagementActions.resolved, false)));
-    const actByPlayer = new Map<number, EngagementActionTypeDB>();
-    for (const a of actionRows) {
-      if (!a.playerId) continue;
-      actByPlayer.set(a.playerId, (a.actionType as any) ?? ("continue" as any));
-    }
-    const attackerChoice = actByPlayer.get(attackerId) ?? ("continue" as any);
-    const defenderChoice = actByPlayer.get(defenderId) ?? ("continue" as any);
-
-    if (attackerChoice === "retreat") {
-      const survivors = await getTileTroops(gameId, tileId, attackerId);
-      await adjustTileUnits(gameId, tileId, attackerId, survivors, -1);
-      await adjustTileUnits(gameId, attackerFromTileId, attackerId, survivors, 1);
-      await syncTileTroops(gameId, tileId);
-      await syncTileTroops(gameId, attackerFromTileId);
-
-      await db
-        .update(engagementActions)
-        .set({ resolved: true })
-        .where(and(eq(engagementActions.gameId, gameId), eq(engagementActions.engagementId, eng.id), eq(engagementActions.turn, turn)));
-
-      await db
-        .update(engagements)
-        .set({ state: "resolved" as any, lastResolvedTurn: turn })
-        .where(eq(engagements.id, eng.id));
-      continue;
-    }
-
-    if (defenderChoice === "retreat") {
-      const dest = await findNearestNonOwnerTile(gameId, tileId, attackerId, defenderId);
-      if (dest) {
-        const survivors = await getTileTroops(gameId, tileId, defenderId);
-        await adjustTileUnits(gameId, tileId, defenderId, survivors, -1);
-        await adjustTileUnits(gameId, dest, defenderId, survivors, 1);
-        await syncTileTroops(gameId, tileId);
-        await syncTileTroops(gameId, dest);
-      }
-
-      await db
-        .update(engagementActions)
-        .set({ resolved: true })
-        .where(and(eq(engagementActions.gameId, gameId), eq(engagementActions.engagementId, eng.id), eq(engagementActions.turn, turn)));
-
-      await db
-        .update(engagements)
-        .set({ state: "resolved" as any, lastResolvedTurn: turn })
-        .where(eq(engagements.id, eng.id));
-      continue;
-    }
-
-    const [tile] = await db.select().from(hexTiles).where(eq(hexTiles.id, tileId));
-    if (!tile) continue;
-
-    const battleResult = await judgeBattle({
-      attackerTroops,
-      defenderTroops,
-      attackerStrategy: "",
-      defenderStrategy: "",
-      terrain: tile.terrain,
-      isCity: Boolean(tile.cityId),
-      cityDefenseLevel: 0,
-    });
-
-    await applyBattleLossesToTile(gameId, tileId, attackerId, battleResult.attackerLosses);
-    await applyBattleLossesToTile(gameId, tileId, defenderId, battleResult.defenderLosses);
-    await syncTileTroops(gameId, tileId);
-
-    const attackerAfter = sumTroops({ ...(await getTileTroops(gameId, tileId, attackerId)), spy: 0 });
-    const defenderAfter = sumTroops({ ...(await getTileTroops(gameId, tileId, defenderId)), spy: 0 });
-
-    if (attackerAfter <= 0 || defenderAfter <= 0) {
-      if (defenderAfter <= 0) {
-        await db.update(hexTiles).set({ ownerId: attackerId }).where(eq(hexTiles.id, tileId));
-        if (tile.cityId) {
-          await db.update(cities).set({ ownerId: attackerId }).where(eq(cities.id, tile.cityId));
-          await updateCityCluster(gameId, tile.cityId, attackerId);
-        }
-        await updateFogOfWar(gameId, attackerId, tileId);
-      }
-
-      await db
-        .update(engagements)
-        .set({ state: "resolved" as any, lastResolvedTurn: turn })
-        .where(eq(engagements.id, eng.id));
-    } else {
-      await db
-        .update(engagements)
-        .set({ state: "engaged" as any, lastResolvedTurn: turn })
-        .where(eq(engagements.id, eng.id));
-    }
-
-    await db
-      .update(engagementActions)
-      .set({ resolved: true })
-      .where(and(eq(engagementActions.gameId, gameId), eq(engagementActions.engagementId, eng.id), eq(engagementActions.turn, turn)));
-  }
-
   // 4) 승리 조건 판정
   const victory = await checkVictoryConditions(gameId, turn);
   if (victory) {
@@ -1472,6 +1334,8 @@ export async function runResolutionPhase(gameId: number, turn: number): Promise<
       content: `승리 조건 달성: ${victory.victoryCondition} (승자: ${victory.winnerPlayerId})`,
     });
   }
+
+  await recomputeFogOfWar(gameId);
 
   return {
     phase: "resolution",
@@ -1806,12 +1670,20 @@ export async function proposeTrade(gameId: number, proposerId: number, responder
       offerSpecialtyAmount: offer.specialtyAmount ?? 0,
       offerUnitType: offer.unitType,
       offerUnitAmount: offer.unitAmount ?? 0,
+      offerPeaceTreaty: Boolean(offer.peaceTreaty),
+      offerShareVision: Boolean(offer.shareVision),
+      offerCityId: offer.cityId != null ? Number(offer.cityId) : null,
+      offerSpyId: offer.spyId != null ? Number(offer.spyId) : null,
       requestGold: request.gold ?? 0,
       requestFood: request.food ?? 0,
       requestSpecialtyType: request.specialtyType,
       requestSpecialtyAmount: request.specialtyAmount ?? 0,
       requestUnitType: request.unitType,
       requestUnitAmount: request.unitAmount ?? 0,
+      requestPeaceTreaty: Boolean(request.peaceTreaty),
+      requestShareVision: Boolean(request.shareVision),
+      requestCityId: request.cityId != null ? Number(request.cityId) : null,
+      requestSpyId: request.spyId != null ? Number(request.spyId) : null,
       proposedTurn: turn,
     })
     .returning();
@@ -1838,6 +1710,10 @@ export async function respondTrade(gameId: number, tradeId: number, responderId:
       specialtyAmount: trade.offerSpecialtyAmount,
       unitType: trade.offerUnitType,
       unitAmount: trade.offerUnitAmount,
+      peaceTreaty: Boolean((trade as any).offerPeaceTreaty),
+      shareVision: Boolean((trade as any).offerShareVision),
+      cityId: (trade as any).offerCityId ?? null,
+      spyId: (trade as any).offerSpyId ?? null,
     }, turn);
   }
 }
@@ -1881,7 +1757,7 @@ export async function createSpy(gameId: number, playerId: number, locationType: 
     throw new Error("Player not found");
   }
 
-  const costGold = 1000;
+  const costGold = 500;
   if ((player.gold ?? 0) < costGold) {
     throw new Error("Not enough gold");
   }
@@ -1912,7 +1788,7 @@ export async function createSpy(gameId: number, playerId: number, locationType: 
         eq(buildings.gameId, gameId),
         eq(buildings.cityId, targetCityId),
         eq(buildings.isConstructing, false),
-        or(eq(buildings.buildingType, "spy_guild"), eq(buildings.buildingType, "intelligence_hq"))
+        or(eq(buildings.buildingType, "embassy"), eq(buildings.buildingType, "spy_guild"), eq(buildings.buildingType, "intelligence_hq"))
       )
     );
   if (required.length === 0) {
@@ -1931,7 +1807,7 @@ export async function createSpy(gameId: number, playerId: number, locationType: 
       mission: "idle",
       experience: 0,
       level: 1,
-      detectionChance: 20,
+      detectionChance: 3,
       isAlive: true,
       createdTurn: turn,
       lastActiveTurn: turn,
@@ -1945,9 +1821,39 @@ export async function deploySpy(gameId: number, spyId: number, mission: SpyMissi
   const [spy] = await db.select().from(spies).where(eq(spies.id, spyId));
   if (!spy || !spy.isAlive) return;
 
+  const createdTurn = spy.createdTurn ?? turn;
+  if (turn < createdTurn + 2) {
+    return;
+  }
+
+  const [player] = await db
+    .select({ id: gamePlayers.id, gold: gamePlayers.gold })
+    .from(gamePlayers)
+    .where(and(eq(gamePlayers.gameId, gameId), eq(gamePlayers.id, spy.playerId!)));
+  if (!player) return;
+  const deployCostGold = 100;
+  if ((player.gold ?? 0) < deployCostGold) return;
+  await db.update(gamePlayers).set({ gold: sql`gold - ${deployCostGold}` }).where(eq(gamePlayers.id, player.id));
+
+  const getCenter = async (locationType: SpyLocationType, locationId: number): Promise<{ q: number; r: number } | null> => {
+    if (locationType === "city") {
+      const [city] = await db.select({ centerTileId: cities.centerTileId }).from(cities).where(eq(cities.id, locationId));
+      if (!city?.centerTileId) return null;
+      const [tile] = await db.select({ q: hexTiles.q, r: hexTiles.r }).from(hexTiles).where(eq(hexTiles.id, city.centerTileId));
+      return tile ? { q: tile.q, r: tile.r } : null;
+    }
+    const [tile] = await db.select({ q: hexTiles.q, r: hexTiles.r }).from(hexTiles).where(eq(hexTiles.id, locationId));
+    return tile ? { q: tile.q, r: tile.r } : null;
+  };
+
+  const from = await getCenter(spy.locationType as any, spy.locationId as any);
+  const to = await getCenter(targetLocationType, targetLocationId);
+  const dist = from && to ? hexDistance(from.q, from.r, to.q, to.r) : 6;
+  const travelTurns = dist <= 4 ? 1 : dist <= 8 ? 2 : 3;
+
   await db
     .update(spies)
-    .set({ mission, locationType: targetLocationType, locationId: targetLocationId, deployedTurn: turn, lastActiveTurn: turn })
+    .set({ mission, locationType: targetLocationType, locationId: targetLocationId, deployedTurn: turn, lastActiveTurn: turn + travelTurns - 1 })
     .where(eq(spies.id, spyId));
 }
 
@@ -1984,10 +1890,27 @@ async function executeSpyMission(gameId: number, spy: Spy, turn: number): Promis
   const attackerEsp = attacker?.espionagePower ?? 50;
   const defenderEsp = defenderId ? (await getPlayerEspionagePower(defenderId)) : 50;
 
+  let defenderBuildingDetectionBonus = 0;
+  if (targetCityId != null && defenderId != null) {
+    const [hq] = await db
+      .select({ id: buildings.id })
+      .from(buildings)
+      .where(
+        and(
+          eq(buildings.gameId, gameId),
+          eq(buildings.cityId, targetCityId),
+          eq(buildings.isConstructing, false),
+          eq(buildings.buildingType, "intelligence_hq")
+        )
+      )
+      .limit(1);
+    if (hq?.id) defenderBuildingDetectionBonus = 3;
+  }
+
   const baseDetection = spy.detectionChance ?? 20;
   const missionMod = spy.mission === "assassination" ? 15 : spy.mission === "sabotage" ? 10 : spy.mission === "theft" ? 5 : 0;
   const defenderMod = Math.max(0, Math.floor((defenderEsp - attackerEsp) / 5));
-  const effectiveDetectionChance = Math.max(5, Math.min(95, baseDetection + missionMod + defenderMod));
+  const effectiveDetectionChance = Math.max(1, Math.min(95, baseDetection + missionMod + defenderMod + defenderBuildingDetectionBonus));
 
   const detectionRoll = Math.random() * 100;
   const isDetected = detectionRoll < effectiveDetectionChance;
@@ -3005,6 +2928,15 @@ async function processTradeSettlement(gameId: number, turn: number): Promise<Arr
     const offerUnitAmount = trade.offerUnitAmount ?? 0;
     const requestUnitAmount = trade.requestUnitAmount ?? 0;
 
+    const offerPeace = Boolean((trade as any).offerPeaceTreaty);
+    const requestPeace = Boolean((trade as any).requestPeaceTreaty);
+    const offerVision = Boolean((trade as any).offerShareVision);
+    const requestVision = Boolean((trade as any).requestShareVision);
+    const offerCityId = (trade as any).offerCityId != null ? Number((trade as any).offerCityId) : null;
+    const requestCityId = (trade as any).requestCityId != null ? Number((trade as any).requestCityId) : null;
+    const offerSpyId = (trade as any).offerSpyId != null ? Number((trade as any).offerSpyId) : null;
+    const requestSpyId = (trade as any).requestSpyId != null ? Number((trade as any).requestSpyId) : null;
+
     // 1) 선검증: 금/식량
     const proposerGoldChange = -offerGold + requestGold;
     const proposerFoodChange = -offerFood + requestFood;
@@ -3020,6 +2952,40 @@ async function processTradeSettlement(gameId: number, turn: number): Promise<Arr
       await db.update(trades).set({ status: "failed", resolvedTurn: turn }).where(eq(trades.id, trade.id));
       results.push({ tradeId: trade.id, status: "failed" });
       continue;
+    }
+
+    // 0) 선검증: 도시/스파이 소유권
+    if (offerCityId != null) {
+      const [c] = await db.select({ ownerId: cities.ownerId, gameId: cities.gameId }).from(cities).where(eq(cities.id, offerCityId));
+      if (!c || c.gameId !== gameId || c.ownerId !== trade.proposerId) {
+        await db.update(trades).set({ status: "failed", resolvedTurn: turn }).where(eq(trades.id, trade.id));
+        results.push({ tradeId: trade.id, status: "failed" });
+        continue;
+      }
+    }
+    if (requestCityId != null) {
+      const [c] = await db.select({ ownerId: cities.ownerId, gameId: cities.gameId }).from(cities).where(eq(cities.id, requestCityId));
+      if (!c || c.gameId !== gameId || c.ownerId !== trade.responderId) {
+        await db.update(trades).set({ status: "failed", resolvedTurn: turn }).where(eq(trades.id, trade.id));
+        results.push({ tradeId: trade.id, status: "failed" });
+        continue;
+      }
+    }
+    if (offerSpyId != null) {
+      const [s] = await db.select({ playerId: spies.playerId, gameId: spies.gameId, isAlive: spies.isAlive }).from(spies).where(eq(spies.id, offerSpyId));
+      if (!s || s.gameId !== gameId || s.playerId !== trade.proposerId || s.isAlive !== true) {
+        await db.update(trades).set({ status: "failed", resolvedTurn: turn }).where(eq(trades.id, trade.id));
+        results.push({ tradeId: trade.id, status: "failed" });
+        continue;
+      }
+    }
+    if (requestSpyId != null) {
+      const [s] = await db.select({ playerId: spies.playerId, gameId: spies.gameId, isAlive: spies.isAlive }).from(spies).where(eq(spies.id, requestSpyId));
+      if (!s || s.gameId !== gameId || s.playerId !== trade.responderId || s.isAlive !== true) {
+        await db.update(trades).set({ status: "failed", resolvedTurn: turn }).where(eq(trades.id, trade.id));
+        results.push({ tradeId: trade.id, status: "failed" });
+        continue;
+      }
     }
 
     // 2) 선검증: 특산물
@@ -3081,6 +3047,61 @@ async function processTradeSettlement(gameId: number, turn: number): Promise<Arr
     // 자원 이전
     await db.update(gamePlayers).set({ gold: proposerNewGold, food: proposerNewFood }).where(eq(gamePlayers.id, trade.proposerId));
     await db.update(gamePlayers).set({ gold: responderNewGold, food: responderNewFood }).where(eq(gamePlayers.id, trade.responderId));
+
+    // 평화 협정 (간단 구현): 양측이 원하면 관계를 neutral로 설정
+    if (offerPeace || requestPeace) {
+      const [rel] = await db
+        .select()
+        .from(diplomacy)
+        .where(and(
+          eq(diplomacy.gameId, gameId),
+          or(
+            and(eq(diplomacy.player1Id, trade.proposerId), eq(diplomacy.player2Id, trade.responderId)),
+            and(eq(diplomacy.player1Id, trade.responderId), eq(diplomacy.player2Id, trade.proposerId))
+          )
+        ));
+      if (rel?.id) {
+        await db.update(diplomacy).set({ status: "neutral" as any, pendingStatus: null, pendingRequesterId: null, pendingTurn: null, lastChanged: new Date() }).where(eq(diplomacy.id, rel.id));
+      } else {
+        await db.insert(diplomacy).values({
+          gameId,
+          player1Id: trade.proposerId,
+          player2Id: trade.responderId,
+          status: "neutral" as any,
+          favorability: 50,
+          lastChanged: new Date(),
+          pendingStatus: null,
+          pendingRequesterId: null,
+          pendingTurn: null,
+        });
+      }
+    }
+
+    // 시야 공유: granter->grantee 행 추가
+    if (offerVision) {
+      await db.insert(visionShares).values({ gameId, granterId: trade.proposerId, granteeId: trade.responderId, createdTurn: turn, revokedTurn: null });
+    }
+    if (requestVision) {
+      await db.insert(visionShares).values({ gameId, granterId: trade.responderId, granteeId: trade.proposerId, createdTurn: turn, revokedTurn: null });
+    }
+
+    // 도시 이전
+    if (offerCityId != null) {
+      await db.update(cities).set({ ownerId: trade.responderId }).where(eq(cities.id, offerCityId));
+      await updateCityCluster(gameId, offerCityId, trade.responderId);
+    }
+    if (requestCityId != null) {
+      await db.update(cities).set({ ownerId: trade.proposerId }).where(eq(cities.id, requestCityId));
+      await updateCityCluster(gameId, requestCityId, trade.proposerId);
+    }
+
+    // 스파이 이전
+    if (offerSpyId != null) {
+      await db.update(spies).set({ playerId: trade.responderId }).where(eq(spies.id, offerSpyId));
+    }
+    if (requestSpyId != null) {
+      await db.update(spies).set({ playerId: trade.proposerId }).where(eq(spies.id, requestSpyId));
+    }
 
     // 특산물 이전 helper
     const transferSpecialty = async (fromPlayerId: number, toPlayerId: number, specType: any, amount: number) => {
@@ -3151,6 +3172,10 @@ async function processTradeSettlement(gameId: number, turn: number): Promise<Arr
     // 거래 상태 완료로 변경
     await db.update(trades).set({ status: "completed", resolvedTurn: turn }).where(eq(trades.id, trade.id));
 
+    // GDD 18장: 행복도 +2% (간단히 즉시 반영)
+    await updateCityHappinessByTrade(gameId, trade.proposerId, 2);
+    await updateCityHappinessByTrade(gameId, trade.responderId, 2);
+
     // 우호도 증가 (GDD 18장)
     const [diplo] = await db
       .select()
@@ -3163,7 +3188,7 @@ async function processTradeSettlement(gameId: number, turn: number): Promise<Arr
         )
       ));
     if (diplo) {
-      const newFavor = Math.min(100, (diplo.favorability ?? 0) + 5);
+      const newFavor = Math.min(100, (diplo.favorability ?? 0) + 2);
       await db.update(diplomacy).set({ favorability: newFavor }).where(eq(diplomacy.id, diplo.id));
     }
 
@@ -3958,6 +3983,22 @@ async function isTileInCityCluster(gameId: number, tileId: number): Promise<bool
   return neighbors.some(n => n.id === tileId);
 }
 
+async function processTax(action: TurnAction): Promise<void> {
+  const data = action.data as {
+    cityId: number;
+    taxRate: number;
+  };
+
+  if (!data?.cityId || !action.playerId) return;
+
+  const [city] = await db.select().from(cities).where(eq(cities.id, data.cityId));
+  if (!city || city.ownerId !== action.playerId) return;
+
+  const next = Number(data.taxRate);
+  if (![5, 10, 15, 20].includes(next)) return;
+  await db.update(cities).set({ taxRate: next }).where(eq(cities.id, city.id));
+}
+
 async function processRecruit(action: TurnAction): Promise<void> {
   const data = action.data as {
     cityId: number;
@@ -3970,8 +4011,16 @@ async function processRecruit(action: TurnAction): Promise<void> {
   const [city] = await db.select().from(cities).where(eq(cities.id, data.cityId));
   if (!city || city.ownerId !== action.playerId) return;
 
+  const population = Math.max(0, Math.floor(city.population ?? 0));
+  if (population <= 0) return;
+
+  const maxRecruit = Math.max(0, Math.floor(population * 0.5));
+  const requested = Math.max(0, Math.floor(data.count));
+  const count = Math.min(requested, maxRecruit);
+  if (count <= 0) return;
+
   const perUnitCost = UnitStats[data.unitType]?.recruitCost ?? 100;
-  const recruitCost = Math.max(0, Math.floor(data.count)) * perUnitCost;
+  const recruitCost = count * perUnitCost;
   
   const [player] = await db.select().from(gamePlayers).where(eq(gamePlayers.id, action.playerId));
   if (!player || (player.gold || 0) < recruitCost) return;
@@ -3980,6 +4029,17 @@ async function processRecruit(action: TurnAction): Promise<void> {
     .update(gamePlayers)
     .set({ gold: (player.gold || 0) - recruitCost })
     .where(eq(gamePlayers.id, action.playerId));
+
+  const recruitRatio = population > 0 ? count / population : 0;
+  let happinessPenalty = 0;
+  if (recruitRatio > 0.5) happinessPenalty = 30;
+  else if (recruitRatio > 0.3) happinessPenalty = 20;
+  else if (recruitRatio > 0.2) happinessPenalty = 10;
+  else if (recruitRatio > 0.1) happinessPenalty = 5;
+
+  const nextPopulation = Math.max(0, population - count);
+  const nextHappiness = Math.max(0, Math.min(100, (city.happiness ?? 70) - happinessPenalty));
+  await db.update(cities).set({ population: nextPopulation, happiness: nextHappiness }).where(eq(cities.id, city.id));
 
   if (city.centerTileId) {
     const add: Record<UnitTypeDB, number> = {
@@ -3990,7 +4050,7 @@ async function processRecruit(action: TurnAction): Promise<void> {
       navy: 0,
       spy: 0,
     };
-    add[data.unitType] = Math.max(0, Math.floor(data.count));
+    add[data.unitType] = count;
     await adjustTileUnits(action.gameId!, city.centerTileId, action.playerId, add, 1, city.id);
     await syncTileTroops(action.gameId!, city.centerTileId);
   }
@@ -4374,7 +4434,8 @@ async function updateCityHappiness(gameId: number, cityId: number) {
 
   // 세율 효과: 높을수록 불행
   const taxRate = city.taxRate ?? 10;
-  happinessDelta -= Math.floor((taxRate - 10) * 0.5);
+  const taxPenalty = taxRate === 5 ? 0 : taxRate === 10 ? 5 : taxRate === 15 ? 15 : taxRate === 20 ? 30 : 5;
+  happinessDelta -= taxPenalty;
 
   // 건물 효과
   for (const b of cityBuildings) {
@@ -4532,11 +4593,19 @@ async function processResourceProduction(gameId: number): Promise<Array<{ player
 
     let foodUpkeep = 0;
     for (const row of upkeepRows) {
-      const cost = UnitStats[row.unitType]?.upkeepCost ?? 0;
-      foodUpkeep += cost * (row.sum ?? 0);
+      if (row.unitType === "spy") continue;
+      const per100 = UnitStats[row.unitType]?.upkeepCost ?? 0;
+      const n = Math.max(0, row.sum ?? 0);
+      foodUpkeep += Math.floor((n / 100) * per100);
     }
 
-    const newGold = (player.gold || 0) + goldIncome;
+    const [{ spyCount }] = await db
+      .select({ spyCount: sql<number>`coalesce(count(*), 0)`.mapWith(Number) })
+      .from(spies)
+      .where(and(eq(spies.gameId, gameId), eq(spies.playerId, player.id), eq(spies.isAlive, true)));
+    const goldUpkeep = Math.max(0, (spyCount ?? 0) * 50);
+
+    const newGold = (player.gold || 0) + goldIncome - goldUpkeep;
     const newFood = (player.food || 0) + foodIncome - foodUpkeep;
 
     // GDD 7장: 자원 저장 한계 적용
@@ -4551,7 +4620,7 @@ async function processResourceProduction(gameId: number): Promise<Array<{ player
 
     results.push({
       playerId: player.id,
-      goldChange: goldIncome,
+      goldChange: goldIncome - goldUpkeep,
       foodChange: foodIncome - foodUpkeep,
     });
   }

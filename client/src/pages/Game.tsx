@@ -125,6 +125,9 @@ export default function Game() {
   const [recruitUnitType, setRecruitUnitType] = useState<UnitType>("infantry");
   const [recruitCount, setRecruitCount] = useState<number>(100);
 
+  const [taxOpen, setTaxOpen] = useState(false);
+  const [taxRateDraft, setTaxRateDraft] = useState<number>(10);
+
   const [diplomacy, setDiplomacy] = useState<DiplomacyData[]>([]);
 
   const [incomingAttacks, setIncomingAttacks] = useState<Array<{ id: number; attackerId: number; targetTileId: number; strategyHint: string | null }>>([]);
@@ -871,15 +874,21 @@ export default function Game() {
   }, []);
 
   const handleManage = useCallback(() => {
-    console.log("Open manage dialog");
-  }, []);
+    if (!selectedCity) {
+      toast({ title: "도시를 선택하세요", variant: "destructive" });
+      return;
+    }
+    const current = Number(selectedCity.taxRate ?? 10);
+    setTaxRateDraft([5, 10, 15, 20].includes(current) ? current : 10);
+    setTaxOpen(true);
+  }, [selectedCity, toast]);
 
   const createSpyInCity = useCallback(async (cityId: number) => {
     if (!roomId) return;
     try {
       await apiRequest("POST", `/api/rooms/${roomId}/spies/create`, { cityId });
       await refetchRoomState();
-      toast({ title: "스파이 생성", description: "스파이를 생성했습니다. (금 1000 소모)" });
+      toast({ title: "스파이 생성", description: "스파이를 생성했습니다. (금 500 소모)" });
     } catch (e: any) {
       toast({ title: "스파이 생성 실패", description: e?.message || "오류가 발생했습니다.", variant: "destructive" });
     }
@@ -1293,6 +1302,8 @@ export default function Game() {
                     roomId={roomId}
                     currentPlayerId={currentPlayer.id}
                     players={players}
+                    cities={cities}
+                    spies={spies}
                     myGold={currentPlayer.gold ?? 0}
                     myFood={currentPlayer.food ?? 0}
                   />
@@ -1730,6 +1741,56 @@ export default function Game() {
         </DialogContent>
       </Dialog>
 
+      <Dialog open={taxOpen} onOpenChange={(open) => !open && setTaxOpen(false)}>
+        <DialogContent className="max-w-md">
+          <DialogHeader>
+            <DialogTitle>세율 조정</DialogTitle>
+            <DialogDescription>세율은 생산량(골드)과 행복도에 영향을 줍니다.</DialogDescription>
+          </DialogHeader>
+
+          <div className="space-y-3">
+            <div className="text-sm text-muted-foreground">
+              현재 세율: {selectedCity ? `${selectedCity.taxRate ?? 10} (x${(Number(selectedCity.taxRate ?? 10) / 10).toFixed(1)})` : "-"}
+            </div>
+
+            <div>
+              <div className="text-sm mb-1">세율</div>
+              <Select value={String(taxRateDraft)} onValueChange={(v) => setTaxRateDraft(Number(v))}>
+                <SelectTrigger>
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="5">저세율 (50%)</SelectItem>
+                  <SelectItem value="10">표준 (100%)</SelectItem>
+                  <SelectItem value="15">고세율 (150%)</SelectItem>
+                  <SelectItem value="20">착취 (200%)</SelectItem>
+                </SelectContent>
+              </Select>
+            </div>
+
+            <div className="text-xs text-muted-foreground">
+              예상 행복도 영향(턴당): {taxRateDraft === 5 ? "0" : taxRateDraft === 10 ? "-5" : taxRateDraft === 15 ? "-15" : taxRateDraft === 20 ? "-30" : "-"}
+            </div>
+          </div>
+
+          <DialogFooter>
+            <Button variant="outline" onClick={() => setTaxOpen(false)}>
+              취소
+            </Button>
+            <Button
+              onClick={() => {
+                if (!selectedCity) return;
+                submitTurnAction("tax", { cityId: Number(selectedCity.id), taxRate: taxRateDraft });
+                setTaxOpen(false);
+              }}
+              disabled={!selectedCity}
+            >
+              세율 제출
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
       <Dialog open={recruitOpen} onOpenChange={(open) => !open && setRecruitOpen(false)}>
         <DialogContent className="max-w-md">
           <DialogHeader>
@@ -1738,6 +1799,15 @@ export default function Game() {
           </DialogHeader>
 
           <div className="space-y-3">
+            <div className="text-sm text-muted-foreground">
+              {selectedCity ? (
+                <>
+                  인구 {Number(selectedCity.population ?? 0).toLocaleString()} / 안전 {Math.floor(Number(selectedCity.population ?? 0) * 0.1).toLocaleString()} / 최대 {Math.floor(Number(selectedCity.population ?? 0) * 0.5).toLocaleString()}
+                </>
+              ) : (
+                <>도시를 선택하세요</>
+              )}
+            </div>
             <div>
               <div className="text-sm mb-1">병과</div>
               <Select value={recruitUnitType} onValueChange={(v) => setRecruitUnitType(v as UnitType)}>
@@ -1764,6 +1834,18 @@ export default function Game() {
               />
               <div className="text-xs text-muted-foreground mt-1">
                 예상 비용: {recruitCount * (UnitStats[recruitUnitType]?.recruitCost ?? 100)} 골드
+              </div>
+              <div className="text-xs text-muted-foreground mt-1">
+                예상 행복도 페널티: {(() => {
+                  const pop = Number(selectedCity?.population ?? 0);
+                  if (!Number.isFinite(pop) || pop <= 0) return "-";
+                  const ratio = Math.max(0, Number(recruitCount)) / pop;
+                  if (ratio > 0.5) return "-30";
+                  if (ratio > 0.3) return "-20";
+                  if (ratio > 0.2) return "-10";
+                  if (ratio > 0.1) return "-5";
+                  return "0";
+                })()}
               </div>
             </div>
           </div>
