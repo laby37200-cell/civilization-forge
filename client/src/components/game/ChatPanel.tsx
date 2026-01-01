@@ -5,12 +5,13 @@ import { ScrollArea } from "@/components/ui/scroll-area";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Avatar, AvatarFallback } from "@/components/ui/avatar";
 import { Send, Globe, Flag, Users, Lock } from "lucide-react";
-import type { ChatMessage } from "@shared/schema";
+import type { ChatMessage, GamePlayer } from "@shared/schema";
 
 interface ChatPanelProps {
   messages: ChatMessage[];
   currentPlayerId: string;
-  onSendMessage: (content: string, channel: ChatMessage["channel"]) => void;
+  players: GamePlayer[];
+  onSendMessage: (content: string, channel: ChatMessage["channel"], targetId?: string | null) => void;
 }
 
 function MessageBubble({ message, isOwn }: { message: ChatMessage; isOwn: boolean }) {
@@ -35,15 +36,32 @@ function MessageBubble({ message, isOwn }: { message: ChatMessage; isOwn: boolea
   );
 }
 
-export function ChatPanel({ messages, currentPlayerId, onSendMessage }: ChatPanelProps) {
+export function ChatPanel({ messages, currentPlayerId, players, onSendMessage }: ChatPanelProps) {
   const [input, setInput] = useState("");
   const [activeChannel, setActiveChannel] = useState<ChatMessage["channel"]>("global");
+  const [privateTargetId, setPrivateTargetId] = useState<string>("");
 
-  const filteredMessages = messages.filter((m) => m.channel === activeChannel);
+  const filteredMessages = messages.filter((m) => {
+    if (m.channel !== activeChannel) return false;
+    if (activeChannel !== "private") return true;
+
+    if (!privateTargetId) return false;
+    const a = m.senderId;
+    const b = m.targetId ?? "";
+    return (
+      (a === currentPlayerId && b === privateTargetId) ||
+      (a === privateTargetId && b === currentPlayerId)
+    );
+  });
 
   const handleSend = () => {
     if (input.trim()) {
-      onSendMessage(input.trim(), activeChannel);
+      if (activeChannel === "private") {
+        if (!privateTargetId) return;
+        onSendMessage(input.trim(), activeChannel, privateTargetId);
+      } else {
+        onSendMessage(input.trim(), activeChannel, null);
+      }
       setInput("");
     }
   };
@@ -54,6 +72,8 @@ export function ChatPanel({ messages, currentPlayerId, onSendMessage }: ChatPane
       handleSend();
     }
   };
+
+  const privateTargets = players.filter((p: GamePlayer) => String(p.id) !== currentPlayerId);
 
   return (
     <div className="h-full flex flex-col bg-card rounded-md border" data-testid="chat-panel">
@@ -94,6 +114,23 @@ export function ChatPanel({ messages, currentPlayerId, onSendMessage }: ChatPane
         </TabsList>
 
         <TabsContent value={activeChannel} className="flex-1 m-0">
+          {activeChannel === "private" && (
+            <div className="p-2 border-b">
+              <div className="text-xs text-muted-foreground mb-1">대화 상대</div>
+              <select
+                className="w-full h-9 rounded-md border bg-background px-3 text-sm"
+                value={privateTargetId}
+                onChange={(e) => setPrivateTargetId(e.target.value)}
+              >
+                <option value="">선택</option>
+                {privateTargets.map((p) => (
+                  <option key={p.id} value={String(p.id)}>
+                    {p.nationId || `Player ${p.id}`}
+                  </option>
+                ))}
+              </select>
+            </div>
+          )}
           <ScrollArea className="h-48">
             <div className="p-3 space-y-3">
               {filteredMessages.length === 0 ? (

@@ -1,3 +1,4 @@
+import "dotenv/config";
 import express, { type Request, Response, NextFunction } from "express";
 import { registerRoutes } from "./routes";
 import { serveStatic } from "./static";
@@ -25,9 +26,11 @@ if (!process.env.SESSION_SECRET) {
   console.warn("[security] SESSION_SECRET not set, using fallback (not recommended for production)");
 }
 
+const sessionSecret = process.env.SESSION_SECRET || "dev-session-secret";
+
 app.use(
   session({
-    secret: process.env.SESSION_SECRET!,
+    secret: sessionSecret,
     resave: false,
     saveUninitialized: false,
     store: new SessionStore({
@@ -112,15 +115,34 @@ app.use((req, res, next) => {
   // Other ports are firewalled. Default to 5000 if not specified.
   // this serves both the API and the client.
   // It is the only port that is not firewalled.
-  const port = parseInt(process.env.PORT || "5000", 10);
-  httpServer.listen(
-    {
-      port,
-      host: "0.0.0.0",
-      reusePort: true,
-    },
-    () => {
-      log(`serving on port ${port}`);
-    },
-  );
+  const basePort = parseInt(process.env.PORT || "5000", 10);
+
+  const listenOnce = (port: number) =>
+    new Promise<void>((resolve, reject) => {
+      const onError = (err: any) => {
+        httpServer.off("error", onError);
+        reject(err);
+      };
+
+      httpServer.once("error", onError);
+      httpServer.listen(port, () => {
+        httpServer.off("error", onError);
+        log(`serving on port ${port}`);
+        resolve();
+      });
+    });
+
+  const maxAttempts = 10;
+  for (let attempt = 0; attempt < maxAttempts; attempt++) {
+    const port = basePort + attempt;
+    try {
+      await listenOnce(port);
+      break;
+    } catch (err: any) {
+      if (err?.code === "EADDRINUSE") {
+        continue;
+      }
+      throw err;
+    }
+  }
 })();

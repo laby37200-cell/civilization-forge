@@ -10,18 +10,31 @@ interface PixiHexMapProps {
   playerColor: string;
 }
 
-const HEX_SIZE = 40;
+const HEX_SIZE = 32;
+const ISO_SCALE_Y = 0.6;
 const HEX_WIDTH = HEX_SIZE * Math.sqrt(3);
-const HEX_HEIGHT = HEX_SIZE * 2;
+const HEX_HEIGHT = HEX_SIZE * 2 * ISO_SCALE_Y;
 
-const TERRAIN_COLORS: Record<TerrainType, number> = {
-  plains: 0x4ade80,
-  grassland: 0x86efac,
-  mountain: 0x6b7280,
-  hill: 0xa3a3a3,
-  forest: 0x166534,
-  desert: 0xfcd34d,
-  sea: 0x0ea5e9,
+const TERRAIN_COLORS: Record<TerrainType, { top: number; side: number }> = {
+  plains: { top: 0x4ade80, side: 0x22c55e },
+  grassland: { top: 0x86efac, side: 0x4ade80 },
+  mountain: { top: 0x9ca3af, side: 0x6b7280 },
+  hill: { top: 0xd1d5db, side: 0xa3a3a3 },
+  forest: { top: 0x22c55e, side: 0x166534 },
+  deep_forest: { top: 0x166534, side: 0x052e16 },
+  desert: { top: 0xfde047, side: 0xeab308 },
+  sea: { top: 0x38bdf8, side: 0x0284c7 },
+};
+
+const TERRAIN_HEIGHT: Record<TerrainType, number> = {
+  plains: 4,
+  grassland: 3,
+  mountain: 20,
+  hill: 12,
+  forest: 8,
+  deep_forest: 10,
+  desert: 2,
+  sea: 0,
 };
 
 function hexToPixel(q: number, r: number): { x: number; y: number } {
@@ -30,22 +43,44 @@ function hexToPixel(q: number, r: number): { x: number; y: number } {
   return { x, y };
 }
 
-function drawHexagon(graphics: Graphics, cx: number, cy: number, color: number, strokeColor: number) {
-  graphics.clear();
-  graphics.poly(getHexPoints(cx, cy));
-  graphics.fill({ color });
-  graphics.stroke({ width: 2, color: strokeColor });
-}
-
 function getHexPoints(cx: number, cy: number): number[] {
   const points: number[] = [];
   for (let i = 0; i < 6; i++) {
     const angle = (Math.PI / 3) * i - Math.PI / 6;
     const x = cx + HEX_SIZE * Math.cos(angle);
-    const y = cy + HEX_SIZE * Math.sin(angle);
+    const y = cy + HEX_SIZE * Math.sin(angle) * ISO_SCALE_Y;
     points.push(x, y);
   }
   return points;
+}
+
+function draw2_5DHex(graphics: Graphics, cx: number, cy: number, terrain: TerrainType, isSelected: boolean, isOwned: boolean, isExplored: boolean = true) {
+  const colors = TERRAIN_COLORS[terrain];
+  const height = TERRAIN_HEIGHT[terrain];
+  const strokeColor = isSelected ? 0xfacc15 : isOwned ? 0x3b82f6 : 0x1e293b;
+
+  const topPoints = getHexPoints(cx, cy - height);
+  
+  if (height > 0) {
+    for (let i = 0; i < 3; i++) {
+      const idx = (i + 3) % 6;
+      const nextIdx = (idx + 1) % 6;
+      const sidePoints = [
+        topPoints[idx * 2], topPoints[idx * 2 + 1],
+        topPoints[nextIdx * 2], topPoints[nextIdx * 2 + 1],
+        topPoints[nextIdx * 2] , topPoints[nextIdx * 2 + 1] + height,
+        topPoints[idx * 2], topPoints[idx * 2 + 1] + height,
+      ];
+      graphics.poly(sidePoints);
+      graphics.fill({ color: colors.side });
+    }
+  }
+
+  graphics.poly(topPoints);
+  // GDD 4장: 전장의 안개 - 미탐험 타일은 어둡게 표시
+  const fillColor = isExplored ? colors.top : 0x1e293b;
+  graphics.fill({ color: fillColor });
+  graphics.stroke({ width: 1, color: strokeColor });
 }
 
 export function PixiHexMap({
@@ -111,15 +146,20 @@ export function PixiHexMap({
         mapContainer.scale.y = Math.max(0.5, Math.min(2, mapContainer.scale.y * scaleFactor));
       });
 
-      tiles.forEach((tile) => {
+      const sortedTiles = [...tiles].sort((a, b) => {
+        if (a.r !== b.r) return a.r - b.r;
+        return a.q - b.q;
+      });
+
+      sortedTiles.forEach((tile) => {
         const { x, y } = hexToPixel(tile.q, tile.r);
         const hexGraphics = new Graphics();
         
-        const color = TERRAIN_COLORS[tile.terrain] || 0x4ade80;
         const isSelected = tile.id === selectedTileId;
-        const strokeColor = isSelected ? 0xfacc15 : (tile.ownerId ? 0x3b82f6 : 0x475569);
+        const isOwned = tile.ownerId !== null;
+        const isExplored = tile.isExplored ?? true;
         
-        drawHexagon(hexGraphics, x, y, color, strokeColor);
+        draw2_5DHex(hexGraphics, x, y, tile.terrain, isSelected, isOwned, isExplored);
         
         hexGraphics.eventMode = "static";
         hexGraphics.cursor = "pointer";
@@ -147,14 +187,15 @@ export function PixiHexMap({
           mapContainer.addChild(cityLabel);
         }
 
-        if (tile.troops > 0) {
+        const troops = tile.troops ?? 0;
+        if (troops > 0) {
           const troopMarker = new Graphics();
           troopMarker.circle(x - 15, y - 15, 8);
           troopMarker.fill({ color: 0x3b82f6 });
           mapContainer.addChild(troopMarker);
 
           const troopText = new Text({
-            text: tile.troops > 999 ? `${Math.floor(tile.troops / 1000)}k` : tile.troops.toString(),
+            text: troops > 999 ? `${Math.floor(troops / 1000)}k` : troops.toString(),
             style: new TextStyle({ fontSize: 8, fill: 0xffffff }),
           });
           troopText.anchor.set(0.5);

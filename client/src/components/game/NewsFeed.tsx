@@ -1,6 +1,6 @@
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { Badge } from "@/components/ui/badge";
-import { Swords, Handshake, Coins, Eye, Building2 } from "lucide-react";
+import { Swords, Handshake, Coins, Eye, Building2, Sparkles } from "lucide-react";
 import { cn } from "@/lib/utils";
 import type { NewsItem } from "@shared/schema";
 
@@ -43,6 +43,12 @@ const categoryConfig: Record<NewsItem["category"], {
     color: "text-green-400", 
     borderColor: "border-l-green-500",
     label: "도시" 
+  },
+  event: {
+    icon: Sparkles,
+    color: "text-slate-300",
+    borderColor: "border-l-slate-400",
+    label: "이벤트",
   },
 };
 

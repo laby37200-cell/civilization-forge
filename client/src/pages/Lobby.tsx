@@ -1,5 +1,6 @@
 import { useState } from "react";
 import { useLocation } from "wouter";
+import { useQuery } from "@tanstack/react-query";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -36,51 +37,20 @@ import {
   Settings,
   Swords,
 } from "lucide-react";
-import { NationsInitialData, CitiesInitialData } from "@shared/schema";
+import { NationsInitialData } from "@shared/schema";
+import { apiRequest, getQueryFn } from "@/lib/queryClient";
+import { useToast } from "@/hooks/use-toast";
 
 interface GameRoom {
-  id: string;
+  id: number;
   name: string;
-  hostName: string;
+  hostId?: number | null;
+  hostName: string | null;
   playerCount: number;
-  maxPlayers: number;
-  mode: "ranked" | "casual" | "custom";
-  turnDuration: 30 | 45 | 60;
-  status: "waiting" | "playing";
+  maxPlayers: number | null;
+  turnDuration: number | null;
+  phase: string | null;
 }
-
-const mockRooms: GameRoom[] = [
-  {
-    id: "1",
-    name: "세계 정복 대전",
-    hostName: "DragonKing",
-    playerCount: 5,
-    maxPlayers: 20,
-    mode: "casual",
-    turnDuration: 45,
-    status: "waiting",
-  },
-  {
-    id: "2",
-    name: "한일전 리턴매치",
-    hostName: "SamuraiMaster",
-    playerCount: 12,
-    maxPlayers: 12,
-    mode: "ranked",
-    turnDuration: 30,
-    status: "playing",
-  },
-  {
-    id: "3",
-    name: "신규 유저 환영",
-    hostName: "Helper001",
-    playerCount: 3,
-    maxPlayers: 10,
-    mode: "casual",
-    turnDuration: 60,
-    status: "waiting",
-  },
-];
 
 const modeLabels = {
   ranked: "랭크",
@@ -94,20 +64,36 @@ const modeColors = {
   custom: "bg-purple-500/10 text-purple-400 border-purple-500/30",
 };
 
-function CreateRoomDialog({ onCreateRoom }: { onCreateRoom: (room: Partial<GameRoom>) => void }) {
+interface CreateRoomOptions {
+  name: string;
+  maxPlayers: number;
+  turnDuration: number;
+  victoryCondition: string;
+  mapMode: string;
+  aiPlayerCount: number;
+  aiDifficulty: string;
+}
+
+function CreateRoomDialog({ onCreateRoom }: { onCreateRoom: (room: CreateRoomOptions) => void }) {
   const [roomName, setRoomName] = useState("");
   const [maxPlayers, setMaxPlayers] = useState("20");
   const [mode, setMode] = useState<"ranked" | "casual" | "custom">("casual");
   const [turnDuration, setTurnDuration] = useState<"30" | "45" | "60">("45");
   const [aiDifficulty, setAiDifficulty] = useState<"easy" | "normal" | "hard">("normal");
+  const [aiPlayerCount, setAiPlayerCount] = useState("0");
+  const [victoryCondition, setVictoryCondition] = useState<"domination" | "economic" | "diplomatic" | "score">("domination");
+  const [mapMode, setMapMode] = useState<"random" | "continents" | "pangaea" | "archipelago">("continents");
   const [open, setOpen] = useState(false);
 
   const handleCreate = () => {
     onCreateRoom({
       name: roomName || "새로운 게임",
       maxPlayers: parseInt(maxPlayers),
-      mode,
-      turnDuration: parseInt(turnDuration) as 30 | 45 | 60,
+      turnDuration: parseInt(turnDuration),
+      victoryCondition,
+      mapMode,
+      aiPlayerCount: parseInt(aiPlayerCount),
+      aiDifficulty,
     });
     setOpen(false);
     setRoomName("");
@@ -189,6 +175,56 @@ function CreateRoomDialog({ onCreateRoom }: { onCreateRoom: (room: Partial<GameR
             </div>
 
             <div className="space-y-2">
+              <Label>승리 조건</Label>
+              <Select value={victoryCondition} onValueChange={(v) => setVictoryCondition(v as typeof victoryCondition)}>
+                <SelectTrigger data-testid="select-victory-condition">
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="domination">정복 승리</SelectItem>
+                  <SelectItem value="economic">경제 승리</SelectItem>
+                  <SelectItem value="diplomatic">외교 승리</SelectItem>
+                  <SelectItem value="score">점수 승리</SelectItem>
+                </SelectContent>
+              </Select>
+            </div>
+          </div>
+
+          <div className="grid grid-cols-2 gap-4">
+            <div className="space-y-2">
+              <Label>맵 모드</Label>
+              <Select value={mapMode} onValueChange={(v) => setMapMode(v as typeof mapMode)}>
+                <SelectTrigger data-testid="select-map-mode">
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="continents">대륙</SelectItem>
+                  <SelectItem value="pangaea">판게아</SelectItem>
+                  <SelectItem value="archipelago">군도</SelectItem>
+                  <SelectItem value="random">랜덤</SelectItem>
+                </SelectContent>
+              </Select>
+            </div>
+
+            <div className="space-y-2">
+              <Label>AI 플레이어 수</Label>
+              <Select value={aiPlayerCount} onValueChange={setAiPlayerCount}>
+                <SelectTrigger data-testid="select-ai-count">
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="0">없음</SelectItem>
+                  <SelectItem value="2">2명</SelectItem>
+                  <SelectItem value="5">5명</SelectItem>
+                  <SelectItem value="10">10명</SelectItem>
+                  <SelectItem value="15">15명</SelectItem>
+                </SelectContent>
+              </Select>
+            </div>
+          </div>
+
+          {parseInt(aiPlayerCount) > 0 && (
+            <div className="space-y-2">
               <Label>AI 난이도</Label>
               <Select value={aiDifficulty} onValueChange={(v) => setAiDifficulty(v as typeof aiDifficulty)}>
                 <SelectTrigger data-testid="select-ai-difficulty">
@@ -201,7 +237,7 @@ function CreateRoomDialog({ onCreateRoom }: { onCreateRoom: (room: Partial<GameR
                 </SelectContent>
               </Select>
             </div>
-          </div>
+          )}
         </div>
 
         <DialogFooter>
@@ -217,9 +253,20 @@ function CreateRoomDialog({ onCreateRoom }: { onCreateRoom: (room: Partial<GameR
   );
 }
 
-function RoomCard({ room, onJoin }: { room: GameRoom; onJoin: () => void }) {
-  const isPlaying = room.status === "playing";
-  const isFull = room.playerCount >= room.maxPlayers;
+function RoomCard({
+  room,
+  onJoin,
+  onDelete,
+  canDelete,
+}: {
+  room: GameRoom;
+  onJoin: () => void | Promise<void>;
+  onDelete: () => void | Promise<void>;
+  canDelete: boolean;
+}) {
+  const isPlaying = room.phase === "playing";
+  const maxPlayers = room.maxPlayers ?? 0;
+  const isFull = maxPlayers > 0 && room.playerCount >= maxPlayers;
 
   return (
     <Card
@@ -232,13 +279,13 @@ function RoomCard({ room, onJoin }: { room: GameRoom; onJoin: () => void }) {
           <div className="flex-1 min-w-0">
             <div className="flex items-center gap-2 mb-1">
               <h3 className="font-medium truncate">{room.name}</h3>
-              <Badge className={modeColors[room.mode]} variant="outline">
-                {modeLabels[room.mode]}
+              <Badge className={modeColors.custom} variant="outline">
+                {modeLabels.custom}
               </Badge>
             </div>
             <div className="flex items-center gap-1 text-sm text-muted-foreground">
               <Crown className="w-3 h-3" />
-              <span>{room.hostName}</span>
+              <span>{room.hostName || "-"}</span>
             </div>
           </div>
           {isPlaying ? (
@@ -250,15 +297,32 @@ function RoomCard({ room, onJoin }: { room: GameRoom; onJoin: () => void }) {
           )}
         </div>
 
+        {canDelete && (
+          <div className="flex justify-end mb-2">
+            <Button
+              size="sm"
+              variant="destructive"
+              onClick={(e) => {
+                e.preventDefault();
+                e.stopPropagation();
+                onDelete();
+              }}
+              data-testid={`button-delete-${room.id}`}
+            >
+              방 삭제
+            </Button>
+          </div>
+        )}
+
         <div className="flex items-center justify-between text-sm">
           <div className="flex items-center gap-4 text-muted-foreground">
             <span className="flex items-center gap-1">
               <Users className="w-4 h-4" />
-              {room.playerCount}/{room.maxPlayers}
+              {room.playerCount}/{room.maxPlayers ?? "-"}
             </span>
             <span className="flex items-center gap-1">
               <Clock className="w-4 h-4" />
-              {room.turnDuration}초
+              {room.turnDuration ?? "-"}초
             </span>
           </div>
           {!isPlaying && !isFull && (
@@ -275,25 +339,87 @@ function RoomCard({ room, onJoin }: { room: GameRoom; onJoin: () => void }) {
 
 export default function Lobby() {
   const [, setLocation] = useLocation();
-  const [rooms, setRooms] = useState<GameRoom[]>(mockRooms);
+  const { toast } = useToast();
 
-  const handleCreateRoom = (roomData: Partial<GameRoom>) => {
-    const newRoom: GameRoom = {
-      id: Date.now().toString(),
-      name: roomData.name || "새로운 게임",
-      hostName: "나",
-      playerCount: 1,
-      maxPlayers: roomData.maxPlayers || 20,
-      mode: roomData.mode || "casual",
-      turnDuration: roomData.turnDuration || 45,
-      status: "waiting",
-    };
-    setRooms([newRoom, ...rooms]);
-    setLocation(`/game/${newRoom.id}`);
+  const meQuery = useQuery<{ user: { id: number; username: string } } | null>({
+    queryKey: ["/api/auth/me"],
+    queryFn: getQueryFn({ on401: "returnNull" }),
+    refetchInterval: false,
+  });
+
+  const roomsQuery = useQuery<GameRoom[]>({
+    queryKey: ["/api/rooms"],
+    queryFn: getQueryFn({ on401: "throw" }),
+    refetchInterval: 3000,
+  });
+
+  const rooms = roomsQuery.data ?? [];
+
+  const myUserId = meQuery.data?.user?.id ?? null;
+
+  const handleCreateRoom = async (roomData: CreateRoomOptions) => {
+    try {
+      const res = await apiRequest("POST", "/api/rooms", {
+        name: roomData.name,
+        maxPlayers: roomData.maxPlayers,
+        turnDuration: roomData.turnDuration,
+        victoryCondition: roomData.victoryCondition,
+        mapMode: roomData.mapMode,
+        aiPlayerCount: roomData.aiPlayerCount,
+        aiDifficulty: roomData.aiDifficulty,
+      });
+      const room = (await res.json()) as { id: number };
+      await roomsQuery.refetch();
+      setLocation(`/game/${room.id}`);
+    } catch (e: any) {
+      if (String(e?.message || "").startsWith("401")) {
+        setLocation("/auth");
+        return;
+      }
+      toast({
+        title: "방 생성 실패",
+        description: e?.message || "요청 처리 중 오류가 발생했습니다.",
+        variant: "destructive",
+      });
+    }
   };
 
-  const handleJoinRoom = (roomId: string) => {
-    setLocation(`/game/${roomId}`);
+  const handleJoinRoom = async (roomId: number) => {
+    try {
+      await apiRequest("POST", `/api/rooms/${roomId}/join`, {});
+      await roomsQuery.refetch();
+      setLocation(`/game/${roomId}`);
+    } catch (e: any) {
+      if (String(e?.message || "").startsWith("401")) {
+        setLocation("/auth");
+        return;
+      }
+      toast({
+        title: "입장 실패",
+        description: e?.message || "요청 처리 중 오류가 발생했습니다.",
+        variant: "destructive",
+      });
+    }
+  };
+
+  const handleDeleteRoom = async (roomId: number) => {
+    const confirmed = window.confirm("정말 이 방을 삭제할까요? 방의 모든 데이터가 삭제됩니다.");
+    if (!confirmed) return;
+    try {
+      await apiRequest("DELETE", `/api/rooms/${roomId}`);
+      await roomsQuery.refetch();
+      toast({ title: "방 삭제 완료" });
+    } catch (e: any) {
+      if (String(e?.message || "").startsWith("401")) {
+        setLocation("/auth");
+        return;
+      }
+      toast({
+        title: "방 삭제 실패",
+        description: e?.message || "요청 처리 중 오류가 발생했습니다.",
+        variant: "destructive",
+      });
+    }
   };
 
   const handleQuickMatch = () => {
@@ -339,11 +465,14 @@ export default function Lobby() {
                 <ScrollArea className="h-[500px] pr-3">
                   <div className="space-y-3">
                     {rooms.map((room) => (
-                      <RoomCard
-                        key={room.id}
-                        room={room}
-                        onJoin={() => handleJoinRoom(room.id)}
-                      />
+                      <div key={room.id}>
+                        <RoomCard
+                          room={room}
+                          onJoin={() => handleJoinRoom(room.id)}
+                          onDelete={() => handleDeleteRoom(room.id)}
+                          canDelete={!!myUserId && room.hostId === myUserId}
+                        />
+                      </div>
                     ))}
                     {rooms.length === 0 && (
                       <div className="text-center text-muted-foreground py-16">
@@ -405,7 +534,7 @@ export default function Lobby() {
               <CardContent className="text-sm space-y-2 text-muted-foreground">
                 <p className="flex items-center gap-2">
                   <Globe className="w-4 h-4" />
-                  {NationsInitialData.length}개 국가, {CitiesInitialData.length}개 도시
+                  {NationsInitialData.length}개 국가, 100개 도시
                 </p>
                 <p className="flex items-center gap-2">
                   <Users className="w-4 h-4" />

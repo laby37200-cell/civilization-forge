@@ -6,18 +6,28 @@ import { ScrollArea } from "@/components/ui/scroll-area";
 import { Separator } from "@/components/ui/separator";
 import { 
   Building2, Castle, Home, Tent, Users, Coins, Wheat, Package,
-  Smile, Frown, Meh, Shield, Swords, Hammer, Eye
+  Smile, Frown, Meh, Swords, Hammer, Eye
 } from "lucide-react";
 import { cn } from "@/lib/utils";
-import type { CityData, CityGrade, BuildingType, BuildingStats } from "@shared/schema";
+import type { CityData, CityGrade, BuildingType, TroopData, UnitType } from "@shared/schema";
 
 interface CityPanelProps {
   city: CityData | null;
+  troops: TroopData | null;
   buildings: BuildingType[];
   onBuild: () => void;
   onRecruit: () => void;
   onManage: () => void;
 }
+
+const unitLabels: Record<UnitType, string> = {
+  infantry: "보병",
+  cavalry: "기병",
+  archer: "궁병",
+  siege: "공성",
+  navy: "해군",
+  spy: "첩보",
+};
 
 const gradeIcons: Record<CityGrade, typeof Castle> = {
   capital: Castle,
@@ -81,7 +91,7 @@ function HappinessIndicator({ happiness }: { happiness: number }) {
   );
 }
 
-export function CityPanel({ city, buildings, onBuild, onRecruit, onManage }: CityPanelProps) {
+export function CityPanel({ city, troops, buildings, onBuild, onRecruit, onManage }: CityPanelProps) {
   if (!city) {
     return (
       <Card className="h-full">
@@ -93,6 +103,16 @@ export function CityPanel({ city, buildings, onBuild, onRecruit, onManage }: Cit
   }
 
   const GradeIcon = gradeIcons[city.grade];
+  const safeTroops: TroopData = troops ?? {
+    infantry: 0,
+    cavalry: 0,
+    archer: 0,
+    siege: 0,
+    navy: 0,
+    spy: 0,
+  };
+  const totalTroops = Object.values(safeTroops).reduce((a, b) => a + b, 0);
+  const troopEntries = (Object.entries(safeTroops) as Array<[UnitType, number]>).filter(([, v]) => v > 0);
 
   return (
     <Card className="h-full flex flex-col" data-testid="city-panel">
@@ -127,7 +147,7 @@ export function CityPanel({ city, buildings, onBuild, onRecruit, onManage }: Cit
                 <Users className="w-4 h-4 text-blue-400" />
                 <div>
                   <div className="text-xs text-muted-foreground">병력</div>
-                  <div className="font-mono text-sm">2,500</div>
+                  <div className="font-mono text-sm">{totalTroops.toLocaleString()}</div>
                 </div>
               </div>
               <div className="flex items-center gap-2 p-2 rounded-md bg-muted/50">
@@ -151,6 +171,32 @@ export function CityPanel({ city, buildings, onBuild, onRecruit, onManage }: Cit
                   <div className="font-mono text-sm">{city.specialtyAmount}</div>
                 </div>
               </div>
+            </div>
+
+            <Separator />
+
+            <div>
+              <div className="flex items-center justify-between mb-2">
+                <h4 className="text-sm font-medium flex items-center gap-1">
+                  <Swords className="w-4 h-4" />
+                  병과 구성
+                </h4>
+              </div>
+              {troopEntries.length === 0 ? (
+                <div className="text-sm text-muted-foreground">주둔 병력이 없습니다</div>
+              ) : (
+                <div className="grid grid-cols-2 gap-2">
+                  {troopEntries.map(([type, count]) => (
+                    <div
+                      key={type}
+                      className="flex items-center justify-between text-sm bg-muted/50 rounded px-2 py-1"
+                    >
+                      <span className="text-muted-foreground">{unitLabels[type]}</span>
+                      <span className="font-mono">{count.toLocaleString()}</span>
+                    </div>
+                  ))}
+                </div>
+              )}
             </div>
 
             <Separator />
