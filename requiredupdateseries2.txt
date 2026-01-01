@@ -1,0 +1,435 @@
+이어서 **(A) GDD 체크리스트 표(챕터별 세부항목 → 구현 위치/상태/비고)**를 실제로 작성하겠습니다. 정확도를 위해 먼저 서버의 핵심 REST 엔드포인트(방/상태/인증)와 클라의 주요 패널(채팅/자원/타이머)을 추가로 확인한 뒤, 챕터 1~23을 “필수 기능” 중심으로 매핑해 드릴게요.
+
+## GDD 전체 기능 매핑 체크리스트 (v11.1 기준, 현재 코드베이스 대비)
+
+표기:
+- **O**: E2E로 연결되어 동작(클라↔WS/REST↔DB↔턴해석↔UI)
+- **△**: 부분 구현(임시/더미/정책 불일치/핵심 디테일 누락/TODO)
+- **X**: 사실상 누락(스키마/로직/UI 중 핵심 부재)
+
+---
+
+# 1부: 게임 개요/핵심 시스템(1~3장)
+
+## 1장 게임 소개/승리조건
+- **정복 승리(100개 도시 점령)**: **△**
+  - **근거**: `turnResolution.ts checkVictoryConditions()`에 domination 존재
+  - **문제**: 실제 “100개 도시” 기준인지, “도시/타일 점령 수” 기준인지 세부 확인 필요(도시 수가 100 맞는지, 점령 판정이 city 중심인지)
+- **턴 제한 점수 승리(300턴)**: **△**
+  - [checkVictoryConditions()](cci:1://file:///d:/civil2/civilization-forge/server/turnResolution.ts:839:0-885:1)에 `turn >= 300` score win 처리 있음
+  - **문제**: Lobby에서 victoryCondition이 `"economic"|"diplomatic"`도 설정 가능하지만 서버 체크는 `"domination"|"score"` 중심
+
+## 2장 실시간 턴 시스템
+- **동시 턴(행동→일괄 판정)**: **O(골격)**
+  - `server/websocket.ts startTurnTimer()` + `turnResolution.ts runTurnStart/runActionsPhase/runResolutionPhase`
+- **턴 페이즈 시간(1초/4초 대기)**: **O**
+- **“모든 명령은 큐에 쌓이고 턴 종료 시 처리” 원칙**: **△**
+  - **문제**: 외교/거래/스파이 일부가 **즉시 REST**로 처리되는 경로가 존재(아래 6부/7부에서 상세)
+
+## 3장 플레이어/세션 관리
+- **회원가입/로그인/세션**: **O**
+  - `routes.ts /api/auth/*`
+- **방 생성/삭제/비활성 정책(0명시 정지/7일 삭제)**: **△**
+  - WS에는 비활성 타이머/7일 삭제 로직 존재
+  - 그러나 “모두 준비 후 시작” 대신 dev auto-start가 있음
+- **게임오버 후 관전자/AI조종**: **△**
+  - WS: `toggle_spectator`, `request_ai_control` 존재
+  - **문제**: 관전자 상태가 DB(`isEliminated`)와 WS(`isSpectator`)로 이원화
+
+---
+
+# 2부: 월드 및 환경(4~6장)
+
+## 4장 월드 맵/시야/전장의 안개
+- **Hex 맵/줌/드래그**: **O**
+  - `client/PixiHexMap.tsx`
+- **전장의 안개(FOW)**: **O(표현/관전자/아이콘 포함)**
+  - DB: `hexTiles.fogOfWar:number[]`
+  - API: `/api/rooms/:id`에서 viewer 기반 `tiles.isExplored` 계산
+  - 렌더: `PixiHexMap`에서 `!isExplored` 타일은 마커 렌더 스킵
+- **시야 공유(동맹)**: **△**
+  - 동맹 시 [shareAllianceVision()](cci:1://file:///d:/civil2/civilization-forge/server/routes.ts:48:0-84:1) 존재
+  - 파기 시 제거 로직 일부 존재(단 “원래 본인이 발견한 시야 vs 동맹으로 얻은 시야” 구분이 불완전)
+- **관전자 시야 규칙**: **△→O(현재는 전체 공개 처리)**
+  - `/api/rooms/:id`에서 `viewer.isEliminated`면 전체 `isExplored=true`
+
+## 5장 타일/지형/도시 클러스터(7타일)
+- **도시 클러스터(중앙+주변6) 소유권 갱신**: **△**
+  - 점령 시 [updateCityCluster()](cci:1://file:///d:/civil2/civilization-forge/server/turnResolution.ts:2268:0-2284:1) 호출
+  - 초기 소유(도시 선택 시)도 주변 타일 ownerId 업데이트가 있으나, “정확히 7타일 세트 유지”는 추가 검증 필요
+- **지형 데이터/색상/전투 보정**: **△**
+  - UI/전투 로직에 지형 반영이 부분적
+
+## 6장 국가/도시 시스템
+- **도시 등급/초기 자원**: **△**
+  - `CityGradeStats`, seed 로직 존재
+  - [gddLoader.ts](cci:7://file:///d:/civil2/civilization-forge/server/gddLoader.ts:0:0-0:0)로 GDD 부록 A에서 일부 파싱하지만, “GDD 전체 데이터 테이블”을 모두 반영하진 못함
+- **도시 성장/승격/수도 이전**: **△**
+  - [updateCityGrowth()](cci:1://file:///d:/civil2/civilization-forge/server/turnResolution.ts:2433:0-2527:1) 존재(간단한 score 기반 승격/수도 이전)
+  - **문제**: GDD의 수식과 다르고(단위/기준 단순화), 수도 함락/국가 버프 등 연계가 TODO
+
+---
+
+# 3부: 경제 및 자원(7~10장)
+
+## 7장 자원 시스템
+- **골드/식량/특산물/병력 스키마**: **O**
+- **자원 생산(턴 시작/종료)**: **△**
+  - [runResolutionPhase()](cci:1://file:///d:/civil2/civilization-forge/server/turnResolution.ts:269:0-315:1)에서 생산 처리 호출
+  - **문제**: 생산량/건물 효과/유지비 차감 등 GDD 디테일 반영 부족
+
+## 8~10장(생산/행복/시장 등)
+- **건물에 따른 생산 보정**: **△**
+  - `BuildingStats`는 존재하지만 “효과 적용 로직”은 부분
+- **행복도/반란**: **△**
+  - [processRebellions()](cci:1://file:///d:/civil2/civilization-forge/server/turnResolution.ts:2531:0-2553:1) 존재(간단 확률), 뉴스 TODO
+- **특산물 시세 변동**: **△**
+  - [simulateMarketFluctuation()](cci:1://file:///d:/civil2/civilization-forge/server/turnResolution.ts:2613:0-2620:1) 호출은 있으나, UI/거래/가격 반영이 E2E로 연결됐는지 불명확
+
+---
+
+# 4부: 군사 및 전투(11~14장)
+
+## 11장 병과/이동/상성
+- **병과 데이터(UnitStats)**: **O**
+- **이동 명령 처리**: **△**
+  - [processMove()](cci:1://file:///d:/civil2/civilization-forge/server/turnResolution.ts:2105:0-2204:1) 존재(세부 검증 필요: 이동 범위, 지형 비용, 해군 제한 등)
+- **상성/지형 보정**: **△**
+  - [llm.ts](cci:7://file:///d:/civil2/civilization-forge/server/llm.ts:0:0-0:0)와 [turnResolution.ts](cci:7://file:///d:/civil2/civilization-forge/server/turnResolution.ts:0:0-0:0)에 중복/불일치 위험(단일화 필요)
+
+## 12~13장 전투(LLM 판정/전투 결과)
+- **공격 처리/전투 생성/DB 저장**: **△→O(기본 전투는 동작)**
+  - [processAttack()](cci:1://file:///d:/civil2/civilization-forge/server/turnResolution.ts:1830:0-2020:1) + `battles` 테이블
+- **전략 텍스트 입력 UI**: **△**
+  - [BattleDialog.tsx](cci:7://file:///d:/civil2/civilization-forge/client/src/components/game/BattleDialog.tsx:0:0-0:0) 있음
+  - **문제**: 방어자가 전략을 입력하는 트리거/동기화가 완성형인지 불명확(서버는 방어자 전략을 AI면 자동, 아니면 빈 문자열로 둠)
+
+## 14장 점령/약탈/수도/국가 버프
+- **점령 후 소유권 변경**: **△**
+- **약탈 처리**: **△(일부 호출/일부 TODO)**
+- **수도 버프/수도 함락 처리**: **X/△**
+  - TODO 다수
+
+---
+
+# 5부: 건물 및 시설(15~16장)
+
+- **건물 건설/업그레이드 큐**: **O**
+  - [processBuild()](cci:1://file:///d:/civil2/civilization-forge/server/turnResolution.ts:2341:0-2395:1), [processBuildQueue()](cci:1://file:///d:/civil2/civilization-forge/server/turnResolution.ts:2397:0-2429:1)
+- **건물 효과(시야/첩보/생산/저장한도/방어)**: **△**
+  - 데이터는 있으나 적용 로직이 제한적
+
+---
+
+# 6부: 외교 및 정보(17~19장)
+
+## 17장 외교
+- **외교 관계 테이블(diplomacy)**: **O**
+- **외교 액션(동맹/전쟁/평화)**: **△**
+  - `routes.ts /diplomacy/propose`는 즉시 반영
+  - 턴 기반 처리([processDiplomacyPhase](cci:1://file:///d:/civil2/civilization-forge/server/turnResolution.ts:322:0-340:1))는 TODO가 많음
+- **동맹 효과(공동방어/자원공유/정보공유)**: **X/△**
+  - 정보공유(시야) 일부
+  - 나머지 TODO
+
+## 18장 거래
+- **거래 테이블(trades)**: **△**
+  - 골드/식량/특산물/병력 필드는 존재
+  - 도시/평화/시야공유/만료턴 등의 GDD 항목은 스키마/로직 없음
+- **거래 제안/수락/체결**: **△**
+  - REST로 즉시 propose/respond
+  - 턴 액션으로도 propose/respond 가능(혼재)
+  - 실제 체결 로직은 골드/식량만 반영, 특산물/병력 TODO
+
+## 19장 첩보/정보전
+- **스파이 생성/파견(REST)**: **△**
+  - `routes.ts /spies/create`, `/spies/:id/deploy`
+- **턴 시작 시 첩보 처리**: **△**
+  - [runTurnStart()](cci:1://file:///d:/civil2/civilization-forge/server/turnResolution.ts:153:0-182:1)에서 처리
+- **첩보 결과 뉴스/공개 범위/카운터 인텔**: **△**
+  - 일부 구현 + 다수 단순화
+
+---
+
+# 7부: UI/UX 및 데이터(20~23장)
+
+## 20장 UI 레이아웃/탭
+- **좌/중/우 패널 + 하단 채팅 구조**: **O(골격)**
+- **탭 구성(도시/외교/거래/첩보/뉴스 등)**: **△**
+  - UI는 있으나 데이터 연결이 부분적(특히 랭킹)
+
+## 21장 뉴스 시스템
+- **뉴스 생성(턴 처리/전투/외교/도시 성장 등)**: **△**
+- **뉴스 공개 범위(global/private/alliance)**: **△**
+- **FOW 기반 `???` 마스킹**: **O(현재는 문자열 치환 방식)**
+  - 구조적 참조 필드가 없어 정밀도는 제한
+
+## 22~23장(데이터/로그/설정 등)
+- **알림 시스템(공격/거래 알림, 탭 배지)**: **X**
+- **리플레이/로그/통계 등**: **X(현재 코드상 핵심 구현 없음)**
+
+---
+
+# 2) “End-to-End 끊기는 지점” 체크리스트(핵심)
+
+## (A) 턴 큐 정책 불일치(가장 중요)
+현재는 아래가 섞여 있습니다:
+- **WS `turn_action`** → `turn_actions`에 저장 → 턴 종료에 처리 (**GDD 방식**)
+- **REST 즉시 처리**:
+  - 외교: `/diplomacy/propose`
+  - 거래: `/trades/propose`, `/trades/:id/respond`
+  - 스파이 생성/파견: `/spies/*`
+
+➡️ 이 상태에서는 “턴 기반 제한/응답 기한/동시 처리” 같은 GDD 기능을 추가할수록 충돌이 납니다.  
+**결론: 외교/거래/첩보는 ‘턴 액션 큐’로 단일화하는 게 우선**입니다.
+
+## (B) UI가 실데이터가 아니라 더미를 씀
+- [Game.tsx](cci:7://file:///d:/civil2/civilization-forge/client/src/pages/Game.tsx:0:0-0:0) 랭킹 탭에서 `mockPlayers` 사용 → 서버 점수와 불일치
+
+## (C) 네이밍/타입 불일치로 매핑이 깨짐
+- `oderId`(user id 역할) 오타가 전 범위에 퍼짐
+- `select_city` WS payload 불일치(서버는 cityName 요구, 클라는 안 줌)
+- [PlayerData](cci:2://file:///d:/civil2/civilization-forge/shared/schema.ts:668:0-682:1)(string id) vs [GamePlayer](cci:2://file:///d:/civil2/civilization-forge/shared/schema.ts:114:0-114:57)(number id) 혼재로 패널에 더미 매핑 발생
+
+---
+
+# 3) 다음 산출물(바로 이어서 할 것)
+원하신 “함수 일관성, 매핑 end-to-end”까지 포함해서 다음 2개를 다음 메시지에서 정리해 드리겠습니다.
+
+1) **기능별 E2E 매핑표(기능 → REST/WS 이벤트 → DB 테이블 → 턴 처리 함수 → UI 컴포넌트)**  
+2) **리팩터링 우선순위(네이밍/타입/큐 정책) + 작업 순서(깨지지 않게 단계화)**
+
+---
+
+## 확인 질문(정리의 정확도를 위해 1개만)
+GDD 기준으로 **외교/거래/첩보 액션은 “반드시 턴 큐(WS turn_action)에 쌓였다가 resolution에서 처리”**가 맞나요?  
+- 맞다면: 기존 REST 즉시 처리 엔드포인트는 “turn_action을 적재하는 thin wrapper”로 바꾸는 방향이 정답입니다.
+- 아니라면: 어떤 기능만 즉시 처리인지(예: 채팅만 즉시, 외교/거래는 턴제 등) 규칙을 먼저 확정해야 합니다.
+
+---
+
+## 상태 요약
+- **진행**: GDD 전체 기능 분해/코드 매핑/일관성 점검/E2E 단절 분석
+- **다음**: 기능별 E2E 매핑표 + 리팩터링/구현 우선순위 로드맵 작성
+
+
+
+===========================================================
+
+
+
+## 처리 정책(사용자 확정) 반영
+- **즉시(Realtime)**  
+  - **채팅**: 즉시 전송/저장/표시  
+  - **거래 “제안”**: 즉시 생성(요청 상태로 누적)  
+  - **스파이 “생성”**: 즉시 생성(대기/자산 확보)
+- **턴 종료 일괄(End-of-turn resolution, 문명 멀티 방식)**  
+  - **이동/공격/건설/징병**  
+  - **거래 “응답/체결/자원 이전”**  
+  - **첩보 “결과 발생/피해/뉴스”**  
+  - **외교 “결과 반영(동맹 체결/선포/평화)”** *(협상은 채팅으로 즉시 가능하지만, 결과 반영은 턴 종료)*
+
+> 아래 체크리스트는 이 정책을 기준으로 “현재 코드가 맞는지/어디가 끊기는지”까지 같이 표시합니다.
+
+---
+
+# Option B: GDD 전체 기능 매핑/누락 상세표 (챕터별)
+
+표기:
+- **O**: 정책 및 E2E 흐름까지 일치(실사용 가능)
+- **△**: 일부 구현/정책 불일치/디테일 누락/더미 UI
+- **X**: 누락(스키마/로직/UI 중 핵심 부재)
+
+각 항목에 **[코드 위치]**를 같이 적었습니다.
+
+---
+
+## 1장. 게임 소개/승리 조건
+- **[정복 승리 100도시]**: △  
+  - **[서버]** `turnResolution.ts checkVictoryConditions()` domination 존재  
+  - **리스크**: “100개 도시” 카운트가 정확히 맞는지(도시 seed/데이터 수/점령 판정) 추가 검증 필요
+- **[턴 제한 점수 승리 300턴]**: △  
+  - **[서버]** [checkVictoryConditions()](cci:1://file:///d:/civil2/civilization-forge/server/turnResolution.ts:839:0-885:1)에 `turn>=300` score win  
+  - **리스크**: Lobby에서 `economic/diplomatic`도 설정 가능하지만 실제 승리판정은 주로 `domination/score`만
+
+---
+
+## 2장. 실시간 턴 시스템(Time Flow)
+- **[동시턴 페이즈(t_start/actions/resolution)]**: O(골격)  
+  - **[서버/WS]** `websocket.ts startTurnTimer()`  
+  - **[서버/로직]** `turnResolution.ts runTurnStart/runActionsPhase/runResolutionPhase`
+- **[“턴 종료에 일괄 처리” 컨셉]**: △  
+  - **문제**: 외교/거래 응답/첩보 결과가 현재 즉시 처리 또는 턴 시작 처리로 섞여 있음(아래 17~19장에서 상세)
+
+---
+
+## 3장. 세션/관전/AI조종
+- **[로그인/세션]**: O  
+  - **[서버]** `routes.ts /api/auth/*`
+- **[방 생성/삭제/목록]**: O  
+  - **[서버]** `routes.ts /api/rooms*`  
+  - **[클라]** [Lobby.tsx](cci:7://file:///d:/civil2/civilization-forge/client/src/pages/Lobby.tsx:0:0-0:0)
+- **[관전자 모드]**: △  
+  - **[서버/WS]** `websocket.ts toggle_spectator` 존재  
+  - **[서버/API]** 관전 FOW 처리는 현재 `viewer.isEliminated` 기준(**WS isSpectator와 모델이 다름**)  
+- **[AI 조종 모드]**: △(기능 플래그 수준)  
+  - **[서버/WS]** `request_ai_control`은 “타겟을 AI로 전환”만
+
+---
+
+## 4장. 월드 맵/시야/전장의 안개
+- **[Hex 타일 맵 렌더/드래그/줌]**: O  
+  - **[클라]** `PixiHexMap.tsx`
+- **[시야/전장의 안개(FOW)]**: O(표현 + 아이콘 마스킹 포함)  
+  - **[DB]** `hex_tiles.fog_of_war:number[]`  
+  - **[서버/API]** `GET /api/rooms/:id`에서 viewer 기준 `isExplored` 계산  
+  - **[클라]** `PixiHexMap`에서 `!isExplored` 타일은 도시/유닛/건물 렌더 스킵
+- **[동맹 시야 공유]**: △  
+  - **[서버]** `routes.ts shareAllianceVision()` / `turnResolution.ts updateFogOfWar()` 연계는 있으나  
+  - **리스크**: “동맹으로 얻은 시야만 제거” 같은 정교한 규칙은 불완전
+
+---
+
+## 5장. 타일/지형/도시 클러스터(7타일)
+- **[도시 클러스터 소유권(중앙+주변6)]**: △  
+  - **[서버]** 점령 시 `turnResolution.ts updateCityCluster()` 호출  
+  - **리스크**: “항상 7타일이 일관되게 도시 소유로 유지”가 보장되는지 추가 점검 필요
+- **[지형 이동 비용/이동 제한(해군/공성 등)]**: △  
+  - **[서버]** 관련 상수 존재([turnResolution.ts](cci:7://file:///d:/civil2/civilization-forge/server/turnResolution.ts:0:0-0:0)), 실제 pathing/제한 구현 정확도는 추가 확인 필요
+
+---
+
+## 6장. 국가/도시 시스템(성장/수도/내전)
+- **[도시 스키마/등급]**: O  
+  - **[DB]** `cities` / `CityGradeStats`
+- **[도시 성장/승격/수도 이전]**: △  
+  - **[서버]** `turnResolution.ts updateCityGrowth()`  
+  - **리스크**: GDD 수식/조건이 단순화됨, 수도 함락/국가 버프 등 연계 TODO
+- **[내전(정의/처리)]**: X/△  
+  - 반란([processRebellions](cci:1://file:///d:/civil2/civilization-forge/server/turnResolution.ts:2531:0-2553:1))은 있으나 “내전=국가 분리/외교 재정의”는 없음
+
+---
+
+## 7~10장. 경제/자원/행복/시장
+- **[자원 생산]**: △  
+  - **[서버]** [runResolutionPhase()](cci:1://file:///d:/civil2/civilization-forge/server/turnResolution.ts:269:0-315:1) → 생산 처리 호출  
+  - **리스크**: 유지비/세율/저장 한도/건물 효과 반영이 부분적
+- **[유지비(식량)]**: X/△  
+  - GDD 핵심인데 “턴마다 병력 유지비 차감”이 명확히 보장되지 않음
+- **[행복/반란]**: △  
+  - **[서버]** [processRebellions()](cci:1://file:///d:/civil2/civilization-forge/server/turnResolution.ts:2531:0-2553:1) 존재(간단 확률), 뉴스 TODO
+- **[특산물 시세]**: △  
+  - 호출은 있으나 “거래/경제 시스템과 가격으로 연결”이 아직 약함
+
+---
+
+## 11~14장. 군사/전투/점령
+- **[공격/전투 판정(LLM)]**: △  
+  - **[서버]** `turnResolution.ts processAttack()` + `llm.ts judgeBattle()`  
+  - **핵심 누락**: “방어자 전략 입력”이 실제로 턴 내 UI/동기화로 완성되어 있는지 부족(현재 방어 전략은 AI만 자동, 인간은 빈 문자열)
+- **[전투 결과/뉴스]**: △  
+  - 생성/저장은 되지만, 공개 범위/정보량(첩보력에 따른 추가정보) 등은 GDD 대비 단순
+- **[점령/도시 소유권 이전]**: △  
+  - 기본 점령/소유권 변경/클러스터 갱신은 있음  
+  - **수도 버프/수도 함락 후 처리**는 TODO가 많음
+
+---
+
+## 15~16장. 건물/시설
+- **[건설 큐/완료 처리]**: O  
+  - **[서버]** [processBuild()](cci:1://file:///d:/civil2/civilization-forge/server/turnResolution.ts:2341:0-2395:1), [processBuildQueue()](cci:1://file:///d:/civil2/civilization-forge/server/turnResolution.ts:2397:0-2429:1)
+- **[건물 효과(생산/방어/시야/첩보)]**: △  
+  - **[문제 유형]** `BuildingStats.effect`는 대부분 텍스트 설명이고 실제 계산 적용은 제한적
+
+---
+
+## 17장. 외교(동맹/전쟁/휴전/우호도)
+- **[외교 관계 테이블]**: O  
+  - **[DB]** `diplomacy`
+- **[외교 결과 반영 “턴 종료 처리”]**: **X/△ (정책 기준으로 불일치)**  
+  - **현재**: `POST /diplomacy/propose`가 **즉시 DB 업데이트**  
+  - **정책**: “외교 결과(동맹 체결/선포/평화)”는 턴 종료 처리  
+  - → 나중에 구조 변경 필요(지금은 리스트업만)
+
+---
+
+## 18장. 거래
+- **[거래 제안 즉시 생성]**: △→정책상 OK 방향  
+  - **[서버]** `POST /trades/propose` 즉시 `trades` row 생성  
+  - **정책**: 제안 생성 즉시는 OK
+- **[거래 응답/체결이 턴 종료 처리]**: **X/△ (정책 기준 불일치)**  
+  - **현재**: [respondTrade()](cci:1://file:///d:/civil2/civilization-forge/server/turnResolution.ts:461:0-484:1)가 accept 시 즉시 [executeTrade()](cci:1://file:///d:/civil2/civilization-forge/server/turnResolution.ts:486:0-514:1) 실행(즉시 자원 이동)  
+  - **정책**: 응답/체결/자원 이전은 턴 종료 처리
+- **[거래 품목 확장]**: X/△  
+  - 스키마에 특산물/병력 칼럼은 있으나 [executeTrade()](cci:1://file:///d:/civil2/civilization-forge/server/turnResolution.ts:486:0-514:1)에 TODO(실제 이전 미구현)  
+  - 도시/평화/시야공유/만료 턴/알림 배지 등은 누락
+
+---
+
+## 19장. 첩보
+- **[스파이 생성 즉시]**: O(정책과 일치)  
+  - **[서버]** `POST /spies/create`
+- **[첩보 결과는 턴 종료 처리]**: **X/△ (정책 기준 불일치 가능성 높음)**  
+  - **현재**: [runTurnStart()](cci:1://file:///d:/civil2/civilization-forge/server/turnResolution.ts:153:0-182:1)에서 [processSpyActions()](cci:1://file:///d:/civil2/civilization-forge/server/turnResolution.ts:625:0-641:1)로 처리(=턴 시작에 결과 발생)  
+  - **정책**: 턴 끝에 처리  
+  - → 나중에 페이즈 이동 필요(예: resolution로)
+
+---
+
+## 20장. UI/패널/조작
+- **[로비/방 생성 UI]**: O  
+  - [Lobby.tsx](cci:7://file:///d:/civil2/civilization-forge/client/src/pages/Lobby.tsx:0:0-0:0)
+- **[게임 화면 탭 구조]**: O(골격)  
+  - [Game.tsx](cci:7://file:///d:/civil2/civilization-forge/client/src/pages/Game.tsx:0:0-0:0) + 각 Panel 컴포넌트
+- **[알림 시스템(상단 알림/탭 배지)]**: X  
+  - 토스트는 있으나 GDD의 “알림 아이콘/거래 요청 알림 배지”는 없음
+
+---
+
+## 21장. 뉴스 시스템
+- **[뉴스 저장/조회]**: △  
+  - **[DB]** `news` 테이블  
+  - **[서버]** 전투/도시성장/외교 등에서 insert
+- **[공개 범위(global/private/alliance)]**: △  
+  - 모델은 있으나 실제 운용이 단순/일관성 점검 필요
+- **[FOW 뉴스 마스킹(???)]**: O(임시 방식)  
+  - 현재는 “도시/국가 이름 문자열 치환” 방식(정밀 참조 필드 없음)
+
+---
+
+## 22~23장. 데이터/운영/밸런스(부록 포함)
+- **[부록 A 데이터 로딩]**: △  
+  - [gddLoader.ts](cci:7://file:///d:/civil2/civilization-forge/server/gddLoader.ts:0:0-0:0)로 일부 파싱(도시/특산물 일부)
+- **[전체 데이터테이블(부록 B/C/D) 반영]**: X  
+  - 유닛/건물/특산물은 코드에 하드코딩 스탯 중심
+
+---
+
+# 4) 현재 코드에서 “정책 불일치”만 뽑은 수정 후보 리스트(추후 작업용)
+
+사용자 정책 기준으로 **나중에 반드시 손봐야 하는 항목**만 정리합니다(지금은 구현하지 않고 목록화).
+
+- **[거래 응답/체결]**  
+  - **현재**: 즉시 자원 이동  
+  - **정책**: 턴 종료 처리  
+  - **후보 변경 위치**: `turnResolution.ts respondTrade()/executeTrade()` + `routes.ts /trades/:id/respond` + 클라 UI 흐름
+- **[외교 결과 반영]**  
+  - **현재**: 즉시 DB 반영  
+  - **정책**: 턴 종료 처리  
+  - **후보 변경 위치**: `routes.ts /diplomacy/propose`를 “제안/합의 상태 저장”으로 바꾸고 turn end에 확정
+- **[첩보 결과 발생 시점]**  
+  - **현재**: [runTurnStart()](cci:1://file:///d:/civil2/civilization-forge/server/turnResolution.ts:153:0-182:1)에서 결과 발생  
+  - **정책**: turn end 처리  
+  - **후보 변경 위치**: [processSpyActions()](cci:1://file:///d:/civil2/civilization-forge/server/turnResolution.ts:625:0-641:1)를 [runResolutionPhase()](cci:1://file:///d:/civil2/civilization-forge/server/turnResolution.ts:269:0-315:1)로 이동 또는 결과만 모아두고 resolution에서 반영
+
+---
+
+# 5) 다음 단계(Option B 계속)
+원하시면 다음 메시지에서 더 “실무적인 산출물”로 이어가겠습니다.
+
+- **(B-1)** “기능별 E2E 매핑표”를 더 촘촘하게  
+  - 예: 거래(제안/응답/체결/뉴스/알림) / 첩보(생성/파견/결과/노출/뉴스)
+- **(B-2)** “누락 기능 Top 30”을 GDD 항목 ID처럼 번호를 매겨서 백로그화  
+  - 구현 난이도/의존성/리스크 포함
+
+원하는 진행은 **B-1(흐름표)** 먼저일까요, 아니면 **B-2(누락 Top30 백로그)** 먼저일까요?

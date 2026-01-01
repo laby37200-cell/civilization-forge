@@ -5,6 +5,7 @@ import {
   cities, 
   gamePlayers, 
   gameRooms,
+  gameNations,
   battles, 
   news,
   specialties,
@@ -174,10 +175,8 @@ export async function runTurnStart(gameId: number, turn: number): Promise<TurnPh
     });
   }
 
-  // 3) 첩보력 성장 및 첩보 활동
+  // 3) 첩보력 성장 (첩보 결과는 턴 종료 시 resolution에서 처리)
   await processEspionagePowerGrowth(gameId);
-  const espionageNews = await processSpyActions(gameId, turn);
-  news.push(...espionageNews);
 
   return { phase: "t_start", newsItems: news };
 }
@@ -275,12 +274,30 @@ export async function runResolutionPhase(gameId: number, turn: number): Promise<
   // 2) 건설 큐 처리
   await processBuildQueue(gameId, turn);
   // 3) 거래 체결 (TODO: implement when trades schema exists)
-  const tradeResults = await processTradeSettlement(gameId);
-  if (tradeResults.length > 0) {
+  const tradeResults = await processTradeSettlement(gameId, turn);
+  const completedTrades = tradeResults.filter((r) => r.status === "completed");
+  const expiredTrades = tradeResults.filter((r) => r.status === "expired");
+  const failedTrades = tradeResults.filter((r) => r.status === "failed");
+
+  if (completedTrades.length > 0) {
     news.push({
       category: "economy",
       title: "거래 체결",
-      content: `${tradeResults.length}건의 거래가 체결되었습니다.`,
+      content: `${completedTrades.length}건의 거래가 체결되었습니다.`,
+    });
+  }
+  if (expiredTrades.length > 0) {
+    news.push({
+      category: "economy",
+      title: "거래 만료",
+      content: `${expiredTrades.length}건의 거래가 만료되었습니다.`,
+    });
+  }
+  if (failedTrades.length > 0) {
+    news.push({
+      category: "economy",
+      title: "거래 실패",
+      content: `${failedTrades.length}건의 거래가 실패했습니다.`,
     });
   }
 
@@ -294,8 +311,16 @@ export async function runResolutionPhase(gameId: number, turn: number): Promise<
   // GDD 15장: 건물 수리 처리
   await processBuildingRepairs(gameId);
 
+  // 내전/국가 분리 처리 (턴 종료 시)
+  const civilWarNews = await processCivilWarActions(gameId, turn);
+  news.push(...civilWarNews);
+
   // GDD 17장: 외교 관계 처리 (동맹 효과/배신/휴전 등)
   await processDiplomacyPhase(gameId, turn);
+
+  // GDD 19장: 첩보 결과 처리 (턴 종료 시)
+  const espionageNews = await processSpyActions(gameId, turn);
+  news.push(...espionageNews);
 
   // 4) 승리 조건 판정
   const victory = await checkVictoryConditions(gameId, turn);
@@ -318,10 +343,199 @@ export async function runResolutionPhase(gameId: number, turn: number): Promise<
 // Export getNeighbors for use in routes.ts
 export { getNeighbors };
 
+async function processCivilWarActions(gameId: number, turn: number): Promise<TurnPhaseResult["newsItems"]> {
+  const out: TurnPhaseResult["newsItems"] = [];
+
+  const actions = await db
+    .select({ id: turnActions.id, playerId: turnActions.playerId, data: turnActions.data })
+    .from(turnActions)
+    .where(and(eq(turnActions.gameId, gameId), eq(turnActions.turn, turn), eq(turnActions.actionType, "civil_war" as any)));
+
+  if (actions.length === 0) return out;
+
+  const latestByPlayer = new Map<number, { id: number; playerId: number; data: any }>();
+  for (const a of actions) {
+    if (!a.playerId) continue;
+    latestByPlayer.set(a.playerId, { id: a.id, playerId: a.playerId, data: a.data as any });
+  }
+
+  const allPlayers = await db.select().from(gamePlayers).where(eq(gamePlayers.gameId, gameId));
+  const playerById = new Map<number, typeof allPlayers[number]>();
+  for (const p of allPlayers) {
+    if (p.id != null) playerById.set(p.id, p);
+  }
+
+  for (const { playerId, data } of Array.from(latestByPlayer.values())) {
+    const p = playerById.get(playerId);
+    if (!p) continue;
+
+    const oldNationId = p.nationId ? String(p.nationId) : null;
+    const requested = (data ?? null) as any;
+    const nameKo = typeof requested?.nameKo === "string" && requested.nameKo.trim() ? requested.nameKo.trim() : `독립국-${playerId}`;
+    const name = typeof requested?.name === "string" && requested.name.trim() ? requested.name.trim() : `Independent-${playerId}`;
+    const color = typeof requested?.color === "string" && requested.color.trim() ? requested.color.trim() : (p.color ?? "#3b82f6");
+
+    const newNationId = `cw_${gameId}_${playerId}_${turn}`;
+
+    await db.insert(gameNations).values({
+      gameId,
+      nationId: newNationId,
+      name,
+      nameKo,
+      color,
+      isDynamic: true,
+      createdTurn: turn,
+    });
+
+    await db.update(gamePlayers).set({ nationId: newNationId, color }).where(eq(gamePlayers.id, playerId));
+
+    // 외교 재정의: 기존 국가 구성원과는 전쟁, 그 외는 중립(최소 구현)
+    for (const other of allPlayers) {
+      if (!other.id || other.id === playerId) continue;
+
+      const sameOldNation = oldNationId != null && other.nationId != null && String(other.nationId) === oldNationId;
+      const status = sameOldNation ? ("war" as const) : ("neutral" as const);
+      const favorability = status === "war" ? 0 : 50;
+
+      const [existingRel] = await db
+        .select()
+        .from(diplomacy)
+        .where(and(
+          eq(diplomacy.gameId, gameId),
+          or(
+            and(eq(diplomacy.player1Id, playerId), eq(diplomacy.player2Id, other.id)),
+            and(eq(diplomacy.player1Id, other.id), eq(diplomacy.player2Id, playerId))
+          )
+        ));
+
+      if (existingRel?.id) {
+        await db.update(diplomacy).set({
+          status,
+          favorability,
+          pendingStatus: null,
+          pendingRequesterId: null,
+          pendingTurn: null,
+          lastChanged: new Date(),
+        }).where(eq(diplomacy.id, existingRel.id));
+      } else {
+        await db.insert(diplomacy).values({
+          gameId,
+          player1Id: playerId,
+          player2Id: other.id,
+          status,
+          favorability,
+          lastChanged: new Date(),
+          pendingStatus: null,
+          pendingRequesterId: null,
+          pendingTurn: null,
+        });
+      }
+    }
+
+    await db.insert(news).values({
+      gameId,
+      turn,
+      category: "event",
+      title: "내전/독립 선언",
+      content: `${p.nationId ?? "Unknown"} 소속 플레이어가 '${nameKo}'(으)로 독립했습니다.`,
+      visibility: "global" satisfies NewsVisibilityDB,
+      involvedPlayerIds: [playerId],
+    });
+  }
+
+  out.push({
+    category: "event",
+    title: "내전 처리",
+    content: `${latestByPlayer.size}명의 독립 선언이 처리되었습니다.`,
+    visibility: "global",
+    involvedPlayerIds: Array.from(latestByPlayer.keys()),
+  });
+
+  return out;
+}
+
 // --- GDD 17장: 외교 시스템 (동맹 효과/배신/휴전 등) ---
+
+// Share vision between allies (internal version for turnResolution) - 선언을 먼저 배치
+async function shareAllianceVisionInternal(gameId: number, player1Id: number, player2Id: number) {
+  const tiles = await db
+    .select({ id: hexTiles.id, fogOfWar: hexTiles.fogOfWar })
+    .from(hexTiles)
+    .where(eq(hexTiles.gameId, gameId));
+
+  for (const tile of tiles) {
+    const fogArray = Array.isArray(tile.fogOfWar) ? tile.fogOfWar as number[] : [];
+    const hasPlayer1 = fogArray.includes(player1Id);
+    const hasPlayer2 = fogArray.includes(player2Id);
+
+    if (hasPlayer1 && !hasPlayer2) {
+      const updatedFog = [...fogArray, player2Id];
+      await db.update(hexTiles).set({ fogOfWar: updatedFog }).where(eq(hexTiles.id, tile.id));
+    } else if (hasPlayer2 && !hasPlayer1) {
+      const updatedFog = [...fogArray, player1Id];
+      await db.update(hexTiles).set({ fogOfWar: updatedFog }).where(eq(hexTiles.id, tile.id));
+    }
+  }
+}
 
 // 외교 관계 처리 (턴마다 동맹 효과/배신 페널티 등)
 async function processDiplomacyPhase(gameId: number, turn: number) {
+  // 0) 대기 중인 외교 제안 처리 (pendingStatus → status 적용)
+  const pendingDiplomacy = await db
+    .select()
+    .from(diplomacy)
+    .where(and(eq(diplomacy.gameId, gameId), isNotNull(diplomacy.pendingStatus)));
+
+  for (const relation of pendingDiplomacy) {
+    if (!relation.pendingStatus || !relation.player1Id || !relation.player2Id) continue;
+
+    const oldStatus = relation.status;
+    const newStatus = relation.pendingStatus;
+
+    // 배신 체크 (동맹/우호 → 전쟁/적대)
+    if ((oldStatus === "alliance" || oldStatus === "friendly") && (newStatus === "war" || newStatus === "hostile")) {
+      await processBetrayal(gameId, relation.pendingRequesterId!, 
+        relation.pendingRequesterId === relation.player1Id ? relation.player2Id : relation.player1Id,
+        oldStatus, newStatus);
+    }
+
+    // 우호도 변경
+    let newFavorability = relation.favorability ?? 50;
+    if (newStatus === "war") {
+      newFavorability = Math.max(0, newFavorability - 50);
+    } else if (newStatus === "alliance") {
+      newFavorability = Math.min(100, newFavorability + 30);
+    } else if (newStatus === "neutral" && oldStatus === "war") {
+      newFavorability = Math.min(100, newFavorability + 20);
+    }
+
+    // 상태 적용 및 pending 클리어
+    await db.update(diplomacy).set({
+      status: newStatus,
+      favorability: newFavorability,
+      pendingStatus: null,
+      pendingRequesterId: null,
+      pendingTurn: null,
+      lastChanged: new Date(),
+    }).where(eq(diplomacy.id, relation.id));
+
+    // 동맹 체결 시 시야 공유
+    if (newStatus === "alliance" && oldStatus !== "alliance") {
+      await shareAllianceVisionInternal(gameId, relation.player1Id, relation.player2Id);
+    }
+
+    // 뉴스 생성
+    await db.insert(news).values({
+      gameId,
+      turn,
+      category: "diplomacy",
+      title: "외교 관계 변화",
+      content: `외교 상태가 ${oldStatus}에서 ${newStatus}(으)로 변경되었습니다.`,
+      visibility: "global" satisfies NewsVisibilityDB,
+      involvedPlayerIds: [relation.player1Id, relation.player2Id],
+    });
+  }
+
   // 1) 동맹 효과: 자원 공유 (간단한 구현)
   const alliances = await db
     .select()
@@ -465,9 +679,8 @@ export async function respondTrade(gameId: number, tradeId: number, responderId:
   if (!trade || trade.responderId !== responderId || trade.status !== "proposed") return;
 
   if (action === "accept") {
-    // 거래 체결
-    await executeTrade(gameId, trade);
-    await db.update(trades).set({ status: "completed", resolvedTurn: turn }).where(eq(trades.id, tradeId));
+    // 거래 수락: 상태만 "accepted"로 변경 (실제 자원 이동은 턴 종료 시 processTradeSettlement()에서 처리)
+    await db.update(trades).set({ status: "accepted", resolvedTurn: turn }).where(eq(trades.id, tradeId));
   } else if (action === "reject") {
     await db.update(trades).set({ status: "rejected", resolvedTurn: turn }).where(eq(trades.id, tradeId));
   } else if (action === "counter" && counterOffer) {
@@ -482,36 +695,6 @@ export async function respondTrade(gameId: number, tradeId: number, responderId:
       unitAmount: trade.offerUnitAmount,
     }, turn);
   }
-}
-
-// 거래 체결 실행 (자원/병력 이동)
-async function executeTrade(gameId: number, trade: Trade) {
-  // 제안자 자원 차감
-  if (trade.offerGold && trade.offerGold > 0) {
-    await db.update(gamePlayers).set({ gold: sql`gold - ${trade.offerGold}` }).where(and(eq(gamePlayers.gameId, gameId), eq(gamePlayers.id, trade.proposerId!)));
-    await db.update(gamePlayers).set({ gold: sql`gold + ${trade.offerGold}` }).where(and(eq(gamePlayers.gameId, gameId), eq(gamePlayers.id, trade.responderId!)));
-  }
-  if (trade.offerFood && trade.offerFood > 0) {
-    await db.update(gamePlayers).set({ food: sql`food - ${trade.offerFood}` }).where(and(eq(gamePlayers.gameId, gameId), eq(gamePlayers.id, trade.proposerId!)));
-    await db.update(gamePlayers).set({ food: sql`food + ${trade.offerFood}` }).where(and(eq(gamePlayers.gameId, gameId), eq(gamePlayers.id, trade.responderId!)));
-  }
-  // TODO: 특산물/병력 거래 구현
-
-  // 응답자 자원 차감
-  if (trade.requestGold && trade.requestGold > 0) {
-    await db.update(gamePlayers).set({ gold: sql`gold - ${trade.requestGold}` }).where(and(eq(gamePlayers.gameId, gameId), eq(gamePlayers.id, trade.responderId!)));
-    await db.update(gamePlayers).set({ gold: sql`gold + ${trade.requestGold}` }).where(and(eq(gamePlayers.gameId, gameId), eq(gamePlayers.id, trade.proposerId!)));
-  }
-  if (trade.requestFood && trade.requestFood > 0) {
-    await db.update(gamePlayers).set({ food: sql`food - ${trade.requestFood}` }).where(and(eq(gamePlayers.gameId, gameId), eq(gamePlayers.id, trade.responderId!)));
-    await db.update(gamePlayers).set({ food: sql`food + ${trade.requestFood}` }).where(and(eq(gamePlayers.gameId, gameId), eq(gamePlayers.id, trade.proposerId!)));
-  }
-  // TODO: 특산물/병력 거래 구현
-
-  // GDD 18장: 거래 시 우호도/행복도 변화
-  await updateDiplomacyFavorability(gameId, trade.proposerId!, trade.responderId!, 5);
-  await updateCityHappinessByTrade(gameId, trade.proposerId!, 3);
-  await updateCityHappinessByTrade(gameId, trade.responderId!, 3);
 }
 
 // 우호도 갱신 (거래 성공 시)
@@ -1633,8 +1816,25 @@ async function processEspionageActions(gameId: number, turn: number): Promise<Ar
 
 // --- Resolution Helper Functions ---
 
-async function processTradeSettlement(gameId: number): Promise<Array<{ tradeId: number; status: string }>> {
+async function processTradeSettlement(gameId: number, turn: number): Promise<Array<{ tradeId: number; status: string }>> {
   const results: Array<{ tradeId: number; status: string }> = [];
+
+  // 제안 만료 처리 (간단한 정책: 3턴 이상 응답 없으면 만료)
+  const [roomRow] = await db
+    .select({ tradeExpireAfterTurns: gameRooms.tradeExpireAfterTurns })
+    .from(gameRooms)
+    .where(eq(gameRooms.id, gameId));
+  const expireAfterTurns = Math.max(0, roomRow?.tradeExpireAfterTurns ?? 3);
+  const expired = await db
+    .select({ id: trades.id, proposedTurn: trades.proposedTurn })
+    .from(trades)
+    .where(and(eq(trades.gameId, gameId), eq(trades.status, "proposed")));
+  for (const t of expired) {
+    if ((turn - (t.proposedTurn ?? turn)) >= expireAfterTurns) {
+      await db.update(trades).set({ status: "expired", resolvedTurn: turn }).where(eq(trades.id, t.id));
+      results.push({ tradeId: t.id, status: "expired" });
+    }
+  }
 
   // 수락된 거래만 체결
   const acceptedTrades = await db
@@ -1649,37 +1849,162 @@ async function processTradeSettlement(gameId: number): Promise<Array<{ tradeId: 
     const [responder] = await db.select().from(gamePlayers).where(eq(gamePlayers.id, trade.responderId));
     if (!proposer || !responder) continue;
 
-    // 거래 내용 (스키마 필드 직접 사용)
+    // 거래 내용
     const offerGold = trade.offerGold ?? 0;
     const offerFood = trade.offerFood ?? 0;
     const requestGold = trade.requestGold ?? 0;
     const requestFood = trade.requestFood ?? 0;
 
-    // 제안자 → 응답자 자원 이전
+    const offerSpecialtyAmount = trade.offerSpecialtyAmount ?? 0;
+    const requestSpecialtyAmount = trade.requestSpecialtyAmount ?? 0;
+    const offerUnitAmount = trade.offerUnitAmount ?? 0;
+    const requestUnitAmount = trade.requestUnitAmount ?? 0;
+
+    // 1) 선검증: 금/식량
     const proposerGoldChange = -offerGold + requestGold;
     const proposerFoodChange = -offerFood + requestFood;
     const responderGoldChange = offerGold - requestGold;
     const responderFoodChange = offerFood - requestFood;
 
-    // 자원 검증 및 이전
     const proposerNewGold = (proposer.gold ?? 0) + proposerGoldChange;
     const proposerNewFood = (proposer.food ?? 0) + proposerFoodChange;
     const responderNewGold = (responder.gold ?? 0) + responderGoldChange;
     const responderNewFood = (responder.food ?? 0) + responderFoodChange;
 
-    // 자원 부족 시 거래 실패
     if (proposerNewGold < 0 || proposerNewFood < 0 || responderNewGold < 0 || responderNewFood < 0) {
-      await db.update(trades).set({ status: "failed" as any }).where(eq(trades.id, trade.id));
+      await db.update(trades).set({ status: "failed", resolvedTurn: turn }).where(eq(trades.id, trade.id));
       results.push({ tradeId: trade.id, status: "failed" });
       continue;
     }
 
-    // 자원 이전 실행
+    // 2) 선검증: 특산물
+    const proposerCities = await db.select({ id: cities.id }).from(cities).where(and(eq(cities.gameId, gameId), eq(cities.ownerId, trade.proposerId)));
+    const responderCities = await db.select({ id: cities.id }).from(cities).where(and(eq(cities.gameId, gameId), eq(cities.ownerId, trade.responderId)));
+
+    const proposerCityIds = proposerCities.map((c) => c.id);
+    const responderCityIds = responderCities.map((c) => c.id);
+
+    if (trade.offerSpecialtyType && offerSpecialtyAmount > 0) {
+      const proposerSpecs = proposerCityIds.length === 0
+        ? []
+        : await db.select().from(specialties).where(and(eq(specialties.gameId, gameId), inArray(specialties.cityId, proposerCityIds), eq(specialties.specialtyType, trade.offerSpecialtyType)));
+      const total = proposerSpecs.reduce((sum, s) => sum + (s.amount ?? 0), 0);
+      if (total < offerSpecialtyAmount) {
+        await db.update(trades).set({ status: "failed", resolvedTurn: turn }).where(eq(trades.id, trade.id));
+        results.push({ tradeId: trade.id, status: "failed" });
+        continue;
+      }
+    }
+
+    if (trade.requestSpecialtyType && requestSpecialtyAmount > 0) {
+      const responderSpecs = responderCityIds.length === 0
+        ? []
+        : await db.select().from(specialties).where(and(eq(specialties.gameId, gameId), inArray(specialties.cityId, responderCityIds), eq(specialties.specialtyType, trade.requestSpecialtyType)));
+      const total = responderSpecs.reduce((sum, s) => sum + (s.amount ?? 0), 0);
+      if (total < requestSpecialtyAmount) {
+        await db.update(trades).set({ status: "failed", resolvedTurn: turn }).where(eq(trades.id, trade.id));
+        results.push({ tradeId: trade.id, status: "failed" });
+        continue;
+      }
+    }
+
+    // 3) 선검증: 병력
+    if (trade.offerUnitType && offerUnitAmount > 0) {
+      const proposerUnits = await db.select().from(units)
+        .where(and(eq(units.gameId, gameId), eq(units.ownerId, trade.proposerId), eq(units.unitType, trade.offerUnitType)));
+      const total = proposerUnits.reduce((sum, u) => sum + (u.count ?? 0), 0);
+      if (total < offerUnitAmount) {
+        await db.update(trades).set({ status: "failed", resolvedTurn: turn }).where(eq(trades.id, trade.id));
+        results.push({ tradeId: trade.id, status: "failed" });
+        continue;
+      }
+    }
+
+    if (trade.requestUnitType && requestUnitAmount > 0) {
+      const responderUnits = await db.select().from(units)
+        .where(and(eq(units.gameId, gameId), eq(units.ownerId, trade.responderId), eq(units.unitType, trade.requestUnitType)));
+      const total = responderUnits.reduce((sum, u) => sum + (u.count ?? 0), 0);
+      if (total < requestUnitAmount) {
+        await db.update(trades).set({ status: "failed", resolvedTurn: turn }).where(eq(trades.id, trade.id));
+        results.push({ tradeId: trade.id, status: "failed" });
+        continue;
+      }
+    }
+
+    // --- 여기까지 통과하면 실제 이전 실행 ---
+
+    // 자원 이전
     await db.update(gamePlayers).set({ gold: proposerNewGold, food: proposerNewFood }).where(eq(gamePlayers.id, trade.proposerId));
     await db.update(gamePlayers).set({ gold: responderNewGold, food: responderNewFood }).where(eq(gamePlayers.id, trade.responderId));
 
+    // 특산물 이전 helper
+    const transferSpecialty = async (fromPlayerId: number, toPlayerId: number, specType: any, amount: number) => {
+      if (!specType || amount <= 0) return;
+
+      const fromCities = await db.select({ id: cities.id }).from(cities).where(and(eq(cities.gameId, gameId), eq(cities.ownerId, fromPlayerId)));
+      const toCities = await db.select({ id: cities.id }).from(cities).where(and(eq(cities.gameId, gameId), eq(cities.ownerId, toPlayerId)));
+      if (fromCities.length === 0 || toCities.length === 0) return;
+
+      const fromCityIds = fromCities.map((c) => c.id);
+      const rows = await db.select().from(specialties).where(and(eq(specialties.gameId, gameId), inArray(specialties.cityId, fromCityIds), eq(specialties.specialtyType, specType)));
+
+      let remaining = amount;
+      for (const row of rows) {
+        if (remaining <= 0) break;
+        const take = Math.min(row.amount ?? 0, remaining);
+        if (take <= 0) continue;
+        await db.update(specialties).set({ amount: sql`amount - ${take}` }).where(eq(specialties.id, row.id));
+        remaining -= take;
+      }
+
+      const targetCityId = toCities[0].id;
+      const [targetRow] = await db.select().from(specialties)
+        .where(and(eq(specialties.gameId, gameId), eq(specialties.cityId, targetCityId), eq(specialties.specialtyType, specType)));
+      if (targetRow) {
+        await db.update(specialties).set({ amount: sql`amount + ${amount}` }).where(eq(specialties.id, targetRow.id));
+      } else {
+        await db.insert(specialties).values({ gameId, cityId: targetCityId, specialtyType: specType, amount });
+      }
+    };
+
+    await transferSpecialty(trade.proposerId, trade.responderId, trade.offerSpecialtyType, offerSpecialtyAmount);
+    await transferSpecialty(trade.responderId, trade.proposerId, trade.requestSpecialtyType, requestSpecialtyAmount);
+
+    // 병력 이전 helper
+    const addUnits = async (ownerId: number, unitType: any, amount: number) => {
+      if (!unitType || amount <= 0) return;
+      const [existing] = await db.select().from(units)
+        .where(and(eq(units.gameId, gameId), eq(units.ownerId, ownerId), eq(units.unitType, unitType)));
+      if (existing) {
+        await db.update(units).set({ count: sql`count + ${amount}` }).where(eq(units.id, existing.id));
+        return;
+      }
+
+      const [city] = await db.select({ id: cities.id }).from(cities).where(and(eq(cities.gameId, gameId), eq(cities.ownerId, ownerId))).limit(1);
+      await db.insert(units).values({ gameId, ownerId, unitType, count: amount, cityId: city?.id ?? null, tileId: null, experience: 0, morale: 100 });
+    };
+
+    const removeUnits = async (ownerId: number, unitType: any, amount: number) => {
+      if (!unitType || amount <= 0) return;
+      const rows = await db.select().from(units)
+        .where(and(eq(units.gameId, gameId), eq(units.ownerId, ownerId), eq(units.unitType, unitType)));
+      let remaining = amount;
+      for (const row of rows) {
+        if (remaining <= 0) break;
+        const take = Math.min(row.count ?? 0, remaining);
+        if (take <= 0) continue;
+        await db.update(units).set({ count: (row.count ?? 0) - take }).where(eq(units.id, row.id));
+        remaining -= take;
+      }
+    };
+
+    await removeUnits(trade.proposerId, trade.offerUnitType, offerUnitAmount);
+    await addUnits(trade.responderId, trade.offerUnitType, offerUnitAmount);
+    await removeUnits(trade.responderId, trade.requestUnitType, requestUnitAmount);
+    await addUnits(trade.proposerId, trade.requestUnitType, requestUnitAmount);
+
     // 거래 상태 완료로 변경
-    await db.update(trades).set({ status: "completed" as any }).where(eq(trades.id, trade.id));
+    await db.update(trades).set({ status: "completed", resolvedTurn: turn }).where(eq(trades.id, trade.id));
 
     // 우호도 증가 (GDD 18장)
     const [diplo] = await db
@@ -1709,18 +2034,21 @@ async function checkDominationVictory(gameId: number): Promise<number | null> {
     .from(cities)
     .where(eq(cities.gameId, gameId));
 
+  const totalCities = cityRows.length;
+  if (totalCities <= 0) return null;
+
   const counts = new Map<number, number>();
-  for (const c of cityRows) {
-    if (!c.ownerId) continue;
-    counts.set(c.ownerId, (counts.get(c.ownerId) ?? 0) + 1);
+  for (const row of cityRows) {
+    const ownerId = row.ownerId;
+    if (!ownerId) continue;
+    counts.set(ownerId, (counts.get(ownerId) ?? 0) + 1);
   }
 
-  // GDD: 정복 승리 = 100개 도시 점령
-  const DOMINATION_CITY_THRESHOLD = 100;
+  // GDD: 정복 승리 = 해당 게임의 모든 도시 점령 (도시 수는 게임마다 달라질 수 있음)
   let winner: number | null = null;
   counts.forEach((cnt, ownerId) => {
     if (winner !== null) return;
-    if (cnt >= DOMINATION_CITY_THRESHOLD) winner = ownerId;
+    if (cnt >= totalCities) winner = ownerId;
   });
   if (winner !== null) return winner;
   return null;
@@ -1885,9 +2213,29 @@ async function processAttack(
     .select({ isAI: gamePlayers.isAI })
     .from(gamePlayers)
     .where(eq(gamePlayers.id, targetTile.ownerId));
-  const defenderStrategy = defenderPlayer?.isAI
-    ? (isCity ? "성채/도시 방어에 집중하며 손실을 최소화하겠습니다." : "지형을 활용해 방어선을 유지하며 반격 기회를 노리겠습니다.")
-    : "";
+  let defenderStrategy = "";
+  if (defenderPlayer?.isAI) {
+    defenderStrategy = isCity
+      ? "성채/도시 방어에 집중하며 손실을 최소화하겠습니다."
+      : "지형을 활용해 방어선을 유지하며 반격 기회를 노리겠습니다.";
+  } else {
+    const [defenseAction] = await db
+      .select({ data: turnActions.data })
+      .from(turnActions)
+      .where(and(
+        eq(turnActions.gameId, gameId),
+        eq(turnActions.turn, turn),
+        eq(turnActions.playerId, targetTile.ownerId),
+        eq(turnActions.actionType, "defense" as any),
+        eq(turnActions.resolved, false)
+      ))
+      .orderBy(sql`id desc`)
+      .limit(1);
+    const d = (defenseAction?.data ?? null) as any;
+    if (typeof d?.strategy === "string") {
+      defenderStrategy = d.strategy;
+    }
+  }
 
   const battleResult = await judgeBattle({
     attackerTroops,
@@ -1911,6 +2259,7 @@ async function processAttack(
       attackerTroops,
       defenderTroops,
       attackerStrategy: data.strategy,
+      defenderStrategy,
       result: battleResult.result,
       attackerLosses: battleResult.attackerLosses,
       defenderLosses: battleResult.defenderLosses,

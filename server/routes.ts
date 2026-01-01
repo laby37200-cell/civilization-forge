@@ -7,6 +7,7 @@ import {
   cities, 
   gamePlayers, 
   gameRooms,
+  gameNations,
   battles, 
   news,
   specialties,
@@ -43,7 +44,7 @@ import { eq, and, sql, gt, lt, or, ne, inArray, isNotNull } from "drizzle-orm";
 import { generateNewsNarrative, judgeBattle } from "./llm";
 import { getNeighbors } from "./turnResolution";
 import { loadAppendixA_Cities } from "./gddLoader";
-import { deploySpy, proposeTrade, respondTrade } from "./turnResolution";
+import { createSpy, deploySpy, proposeTrade, respondTrade } from "./turnResolution";
 import { hash, compare } from "bcrypt";
 
 // Share existing vision between new allies
@@ -203,6 +204,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
         mapMode: req.body.mapMode || "continents",
         aiPlayerCount: req.body.aiPlayerCount || 0,
         aiDifficulty: req.body.aiDifficulty || "normal",
+        tradeExpireAfterTurns: req.body.tradeExpireAfterTurns || 3,
       }).returning();
 
       createdRoomId = room.id;
@@ -274,6 +276,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
     await db.delete(cities).where(eq(cities.gameId, roomId));
     await db.delete(hexTiles).where(eq(hexTiles.gameId, roomId));
     await db.delete(gamePlayers).where(eq(gamePlayers.gameId, roomId));
+    await db.delete(gameNations).where(eq(gameNations.gameId, roomId));
     await db.delete(gameRooms).where(eq(gameRooms.id, roomId));
 
     res.json({ success: true });
@@ -288,6 +291,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
     }
 
     const players = await db.select().from(gamePlayers).where(eq(gamePlayers.gameId, roomId));
+    const nationRows = await db.select().from(gameNations).where(eq(gameNations.gameId, roomId));
     const cityList = await db.select().from(cities).where(eq(cities.gameId, roomId));
     const tiles = await db.select().from(hexTiles).where(eq(hexTiles.gameId, roomId));
     const unitList = await db.select().from(units).where(eq(units.gameId, roomId));
@@ -304,6 +308,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
 
     const viewerPlayerId = viewer?.id ?? null;
     const viewerNationId = viewer?.nationId ?? null;
+    const isSpectatorView = viewer?.isEliminated === true;
 
     const allianceRows = await db
       .select({ player1Id: diplomacy.player1Id, player2Id: diplomacy.player2Id })
@@ -350,12 +355,72 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
       return false;
     });
 
+    const tilesWithFog = tiles.map((t) => {
+      const exploredForViewer =
+        viewerPlayerId == null || isSpectatorView
+          ? true
+          : Array.isArray((t as any).fogOfWar)
+            ? ((t as any).fogOfWar as number[]).includes(viewerPlayerId)
+            : false;
+      const { fogOfWar: _fogOfWar, ...rest } = t as any;
+      return { ...rest, isExplored: exploredForViewer };
+    });
+
+    const visibleTileIds = new Set<number>();
+    for (const t of tilesWithFog) {
+      if ((t as any).isExplored) {
+        visibleTileIds.add((t as any).id as number);
+      }
+    }
+
+    const visibleCityIds = new Set<number>();
+    const visibleNationIds = new Set<string>();
+    for (const c of cityList) {
+      const centerTileId = (c as any).centerTileId as number | null | undefined;
+      if (centerTileId != null && visibleTileIds.has(centerTileId)) {
+        visibleCityIds.add((c as any).id as number);
+        if ((c as any).nationId) {
+          visibleNationIds.add(String((c as any).nationId));
+        }
+      }
+    }
+
+    const replaceAllSafe = (input: string, search: string, replacement: string) => {
+      if (!search) return input;
+      return input.split(search).join(replacement);
+    };
+
+    const maskNewsText = (text: string) => {
+      if (viewerPlayerId == null || isSpectatorView) return text;
+      let out = text;
+
+      for (const c of cityList) {
+        const cityId = (c as any).id as number;
+        if (visibleCityIds.has(cityId)) continue;
+        const nameKo = String((c as any).nameKo ?? "");
+        const name = String((c as any).name ?? "");
+        out = replaceAllSafe(out, nameKo, "???");
+        out = replaceAllSafe(out, name, "???");
+      }
+
+      for (const n of nationRows) {
+        const nid = String((n as any).nationId ?? "");
+        if (!nid) continue;
+        if (visibleNationIds.has(nid)) continue;
+        out = replaceAllSafe(out, String((n as any).nameKo ?? ""), "???");
+        out = replaceAllSafe(out, String((n as any).name ?? ""), "???");
+        out = replaceAllSafe(out, nid, "???");
+      }
+
+      return out;
+    };
+
     const newsList = filteredNewsRows.map((n) => ({
       id: String(n.id),
       turn: n.turn,
       category: n.category,
-      title: n.title,
-      content: n.content,
+      title: maskNewsText(n.title),
+      content: maskNewsText(n.content),
       involvedPlayers: (n.involvedPlayerIds ?? []).map((x: number) => String(x)),
       timestamp: n.createdAt ? new Date(n.createdAt).getTime() : Date.now(),
     }));
@@ -371,22 +436,12 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
       timestamp: m.createdAt ? new Date(m.createdAt).getTime() : Date.now(),
     }));
 
-    const tilesWithFog = tiles.map((t) => {
-      const exploredForViewer =
-        viewerPlayerId == null
-          ? true
-          : Array.isArray((t as any).fogOfWar)
-            ? ((t as any).fogOfWar as number[]).includes(viewerPlayerId)
-            : false;
-      const { fogOfWar: _fogOfWar, ...rest } = t as any;
-      return { ...rest, isExplored: exploredForViewer };
-    });
-
     res.json({
       room: {
         ...room,
         turnEndTime: room.turnEndTime ? new Date(room.turnEndTime).getTime() : null,
       },
+      nations: nationRows,
       players,
       cities: cityList,
       tiles: tilesWithFog,
@@ -445,7 +500,10 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
 
     const roomId = parseInt(req.params.id);
     const nationId = String(req.body?.nationId ?? "").trim();
-    const nation = NationsInitialData.find((n: { id: string }) => n.id === nationId);
+    const [nation] = await db
+      .select()
+      .from(gameNations)
+      .where(and(eq(gameNations.gameId, roomId), eq(gameNations.nationId, nationId)));
     if (!nation) {
       return res.status(400).json({ error: "Invalid nationId" });
     }
@@ -591,6 +649,9 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
         playerId2: String(d.player2Id ?? ""),
         status: d.status,
         favorability: d.favorability ?? 0,
+        pendingStatus: d.pendingStatus ?? null,
+        pendingRequesterId: d.pendingRequesterId != null ? String(d.pendingRequesterId) : null,
+        pendingTurn: d.pendingTurn ?? null,
       }))
     );
   });
@@ -634,40 +695,16 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
         )
       );
 
-    let status: any = "neutral";
-    let favorability = 0;
+    // 유효한 액션 검증
+    let pendingStatus: any = null;
     if (action === "declare_war") {
-      status = "war";
-      favorability = -100;
+      pendingStatus = "war";
     } else if (action === "propose_alliance") {
-      status = "alliance";
-      favorability = 80;
+      pendingStatus = "alliance";
     } else if (action === "offer_peace") {
-      status = "neutral";
-      favorability = 0;
+      pendingStatus = "neutral";
     } else {
       return res.status(400).json({ error: "Invalid action" });
-    }
-
-    if (existing) {
-      await db
-        .update(diplomacy)
-        .set({ status, favorability, lastChanged: new Date() })
-        .where(eq(diplomacy.id, existing.id));
-    } else {
-      await db.insert(diplomacy).values({
-        gameId: roomId,
-        player1Id: player.id,
-        player2Id: targetPlayerId,
-        status,
-        favorability,
-        lastChanged: new Date(),
-      });
-    }
-
-    // If forming an alliance, share existing vision between allies
-    if (status === "alliance") {
-      await shareAllianceVision(roomId, player.id, targetPlayerId);
     }
 
     const [roomRow] = await db
@@ -676,17 +713,43 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
       .where(eq(gameRooms.id, roomId));
     const turn = roomRow?.turn ?? 1;
 
+    // 외교 제안: pendingStatus만 설정 (실제 반영은 턴 종료 시 processDiplomacyPhase()에서 처리)
+    if (existing) {
+      await db
+        .update(diplomacy)
+        .set({ 
+          pendingStatus, 
+          pendingRequesterId: player.id,
+          pendingTurn: turn,
+          lastChanged: new Date() 
+        })
+        .where(eq(diplomacy.id, existing.id));
+    } else {
+      await db.insert(diplomacy).values({
+        gameId: roomId,
+        player1Id: player.id,
+        player2Id: targetPlayerId,
+        status: "neutral",
+        favorability: 50,
+        pendingStatus,
+        pendingRequesterId: player.id,
+        pendingTurn: turn,
+        lastChanged: new Date(),
+      });
+    }
+
+    // 외교 제안 뉴스 (실제 결과는 턴 종료 시)
     await db.insert(news).values({
       gameId: roomId,
       turn,
       category: "diplomacy",
-      title: "외교 변화",
-      content: `${player.nationId ?? "Player"} → ${targetPlayer.nationId ?? "Player"}: ${status}`,
+      title: "외교 제안",
+      content: `${player.nationId ?? "Player"}이(가) ${targetPlayer.nationId ?? "Player"}에게 ${pendingStatus === "war" ? "선전포고" : pendingStatus === "alliance" ? "동맹" : "평화"}를 제안했습니다.`,
       visibility: "global" satisfies NewsVisibilityDB,
       involvedPlayerIds: [player.id, targetPlayerId],
     });
 
-    res.json({ success: true });
+    res.json({ success: true, pending: true });
   });
 
   app.get("/api/rooms/:id/trades", async (req, res) => {
@@ -741,9 +804,14 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
     const roomId = parseInt(req.params.id);
     const tradeId = parseInt(req.params.tradeId);
     const action = String(req.body?.action ?? "");
+    const counterOffer = req.body?.counterOffer ?? null;
 
-    if (action !== "accept" && action !== "reject") {
+    if (action !== "accept" && action !== "reject" && action !== "counter") {
       return res.status(400).json({ error: "Invalid action" });
+    }
+
+    if (action === "counter" && !counterOffer) {
+      return res.status(400).json({ error: "Missing counterOffer" });
     }
 
     const [player] = await db
@@ -760,7 +828,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
       .where(eq(gameRooms.id, roomId));
     const turn = roomRow?.turn ?? 1;
 
-    await respondTrade(roomId, tradeId, player.id, action as any, null, turn);
+    await respondTrade(roomId, tradeId, player.id, action as any, counterOffer, turn);
     res.json({ success: true });
   });
 
@@ -792,32 +860,39 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
       return res.status(404).json({ error: "City not found" });
     }
 
-    const cost = 1000;
-    if ((player.gold ?? 0) < cost) {
-      return res.status(400).json({ error: "Not enough gold" });
-    }
-
-    await db.update(gamePlayers).set({ gold: sql`gold - ${cost}` }).where(eq(gamePlayers.id, player.id));
-
     const [roomRow] = await db
       .select({ turn: gameRooms.currentTurn })
       .from(gameRooms)
       .where(eq(gameRooms.id, roomId));
     const turn = roomRow?.turn ?? 1;
 
-    const [created] = await db
-      .insert(spies)
-      .values({
-        gameId: roomId,
-        playerId: player.id,
-        locationType: "city" satisfies SpyLocationType,
-        locationId: cityId,
-        mission: "idle" satisfies SpyMission,
-        createdTurn: turn,
-      })
-      .returning();
+    try {
+      const spyId = await createSpy(
+        roomId,
+        player.id,
+        "city" satisfies SpyLocationType,
+        cityId,
+        turn
+      );
 
-    res.json(created);
+      const [created] = await db.select().from(spies).where(eq(spies.id, spyId));
+      if (!created) {
+        return res.status(500).json({ error: "Failed to create spy" });
+      }
+      res.json(created);
+    } catch (e: any) {
+      const message = String(e?.message ?? "Failed to create spy");
+      // map common validation errors to 400
+      if (
+        message.includes("Not enough gold") ||
+        message.includes("Missing required building") ||
+        message.includes("City not owned") ||
+        message.includes("Spy must be created in a city")
+      ) {
+        return res.status(400).json({ error: message });
+      }
+      return res.status(500).json({ error: message });
+    }
   });
 
   app.post("/api/rooms/:id/spies/:spyId/deploy", async (req, res) => {
@@ -873,7 +948,12 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
         .from(hexTiles)
         .where(eq(hexTiles.gameId, roomId));
 
-      if ((existing?.count ?? 0) > 0) {
+      const [existingNations] = await db
+        .select({ count: sql<number>`count(*)`.mapWith(Number) })
+        .from(gameNations)
+        .where(eq(gameNations.gameId, roomId));
+
+      if ((existing?.count ?? 0) > 0 && (existingNations?.count ?? 0) > 0) {
         console.log(`[seedRoom] Room ${roomId} already initialized, skipping`);
         return;
       }
@@ -893,6 +973,25 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
       }
 
       console.log(`[seedRoom] Room config:`, room);
+
+      if ((existingNations?.count ?? 0) === 0) {
+        await db.insert(gameNations).values(
+          NationsInitialData.map((n: { id: string; name: string; nameKo: string; color: string }) => ({
+            gameId: roomId,
+            nationId: n.id,
+            name: n.name,
+            nameKo: n.nameKo,
+            color: n.color,
+            isDynamic: false,
+            createdTurn: 0,
+          }))
+        );
+      }
+
+      if ((existing?.count ?? 0) > 0) {
+        console.log(`[seedRoom] Room ${roomId} tiles already initialized; nations seeded if missing`);
+        return;
+      }
 
       const mapWidth = room?.mapWidth ?? 60;
       const mapHeight = room?.mapHeight ?? 30;
@@ -1059,14 +1158,26 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
     }
 
     if (room?.aiPlayerCount && room.aiPlayerCount > 0) {
-      const availableNations = NationsInitialData;
+      const capitalNationRows = await db
+        .select({ nationId: cities.nationId })
+        .from(cities)
+        .where(and(eq(cities.gameId, roomId), eq(cities.grade, "capital"), isNotNull(cities.nationId)));
+      const capitalNationIds = Array.from(new Set(capitalNationRows.map((r) => String(r.nationId))));
+
+      const availableNations = capitalNationIds.length > 0
+        ? await db
+            .select()
+            .from(gameNations)
+            .where(and(eq(gameNations.gameId, roomId), inArray(gameNations.nationId, capitalNationIds)))
+        : await db.select().from(gameNations).where(eq(gameNations.gameId, roomId));
+
       const shuffledNations = availableNations.slice().sort(() => Math.random() - 0.5);
       const nationsForAI = shuffledNations.slice(0, Math.min(room.aiPlayerCount, shuffledNations.length));
 
       const aiDifficulty = (room.aiDifficulty ?? "normal") as AIDifficulty;
-      const aiPlayerRows = nationsForAI.map((nation: { id: string; color: string }) => ({
+      const aiPlayerRows = nationsForAI.map((nation: { nationId: string; color: string }) => ({
         gameId: roomId,
-        nationId: nation.id,
+        nationId: nation.nationId,
         isAI: true,
         aiDifficulty,
         color: nation.color,

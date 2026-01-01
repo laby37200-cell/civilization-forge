@@ -1,4 +1,4 @@
-import { useState, useEffect } from "react";
+import { useState, useEffect, useMemo } from "react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
@@ -11,9 +11,11 @@ import {
 } from "@/components/ui/select";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
+import { ScrollArea } from "@/components/ui/scroll-area";
 import { apiRequest } from "@/lib/queryClient";
 import { useToast } from "@/hooks/use-toast";
-import type { Trade, TradeStatus, GamePlayer } from "@shared/schema";
+import { SpecialtyStats } from "@shared/schema";
+import type { Trade, TradeStatus, GamePlayer, SpecialtyType, UnitTypeDB } from "@shared/schema";
 
 interface TradePanelProps {
   roomId: number;
@@ -25,12 +27,44 @@ interface TradePanelProps {
 
 export function TradePanel({ roomId, currentPlayerId, players, myGold, myFood }: TradePanelProps) {
   const [trades, setTrades] = useState<Trade[]>([]);
+  const [roomTurn, setRoomTurn] = useState<number>(1);
+  const [tradeExpireAfterTurns, setTradeExpireAfterTurns] = useState<number>(3);
+
+  const [statusFilter, setStatusFilter] = useState<
+    "all" | "action_required" | "active" | "completed" | "failed" | "expired" | "rejected" | "countered"
+  >("all");
+
+  const [counterTradeId, setCounterTradeId] = useState<number | null>(null);
+  const [counterOfferGold, setCounterOfferGold] = useState(0);
+  const [counterOfferFood, setCounterOfferFood] = useState(0);
+  const [counterOfferSpecialtyType, setCounterOfferSpecialtyType] = useState<SpecialtyType | "">("");
+  const [counterOfferSpecialtyAmount, setCounterOfferSpecialtyAmount] = useState(0);
+  const [counterOfferUnitType, setCounterOfferUnitType] = useState<UnitTypeDB | "">("");
+  const [counterOfferUnitAmount, setCounterOfferUnitAmount] = useState(0);
+
   const [proposeTargetId, setProposeTargetId] = useState<number | null>(null);
   const [offerGold, setOfferGold] = useState(0);
   const [offerFood, setOfferFood] = useState(0);
+  const [offerSpecialtyType, setOfferSpecialtyType] = useState<SpecialtyType | "">("");
+  const [offerSpecialtyAmount, setOfferSpecialtyAmount] = useState(0);
+  const [offerUnitType, setOfferUnitType] = useState<UnitTypeDB | "">("");
+  const [offerUnitAmount, setOfferUnitAmount] = useState(0);
   const [requestGold, setRequestGold] = useState(0);
   const [requestFood, setRequestFood] = useState(0);
+  const [requestSpecialtyType, setRequestSpecialtyType] = useState<SpecialtyType | "">("");
+  const [requestSpecialtyAmount, setRequestSpecialtyAmount] = useState(0);
+  const [requestUnitType, setRequestUnitType] = useState<UnitTypeDB | "">("");
+  const [requestUnitAmount, setRequestUnitAmount] = useState(0);
   const { toast } = useToast();
+
+  const unitTypeLabels: Record<UnitTypeDB, string> = {
+    infantry: "보병",
+    cavalry: "기병",
+    archer: "궁병",
+    siege: "공성",
+    navy: "해군",
+    spy: "첩보",
+  };
 
   const fetchTrades = async () => {
     try {
@@ -47,12 +81,38 @@ export function TradePanel({ roomId, currentPlayerId, players, myGold, myFood }:
     // TODO: WS로 실시간 갱신
   }, [roomId]);
 
+  useEffect(() => {
+    const loadRoomConfig = async () => {
+      try {
+        const res = await apiRequest("GET", `/api/rooms/${roomId}`);
+        const json = await res.json();
+        const turn = Number(json?.room?.currentTurn ?? 1);
+        const expire = Number(json?.room?.tradeExpireAfterTurns ?? 3);
+        setRoomTurn(Number.isFinite(turn) ? turn : 1);
+        setTradeExpireAfterTurns(Number.isFinite(expire) ? expire : 3);
+      } catch {
+        setRoomTurn(1);
+        setTradeExpireAfterTurns(3);
+      }
+    };
+    loadRoomConfig();
+  }, [roomId]);
+
   const handlePropose = async () => {
     if (proposeTargetId == null) {
       toast({ title: "대상을 선택해주세요", variant: "destructive" });
       return;
     }
-    if (offerGold < 0 || offerFood < 0 || requestGold < 0 || requestFood < 0) {
+    if (
+      offerGold < 0 ||
+      offerFood < 0 ||
+      offerSpecialtyAmount < 0 ||
+      offerUnitAmount < 0 ||
+      requestGold < 0 ||
+      requestFood < 0 ||
+      requestSpecialtyAmount < 0 ||
+      requestUnitAmount < 0
+    ) {
       toast({ title: "자원은 0 이상이어야 합니다", variant: "destructive" });
       return;
     }
@@ -60,7 +120,27 @@ export function TradePanel({ roomId, currentPlayerId, players, myGold, myFood }:
       toast({ title: "보유 자원이 부족합니다", variant: "destructive" });
       return;
     }
-    if ((offerGold === 0 && offerFood === 0) || (requestGold === 0 && requestFood === 0)) {
+    if ((offerSpecialtyAmount > 0 && !offerSpecialtyType) || (offerSpecialtyAmount === 0 && offerSpecialtyType)) {
+      toast({ title: "제안 특산물 타입/수량을 확인해주세요", variant: "destructive" });
+      return;
+    }
+    if ((requestSpecialtyAmount > 0 && !requestSpecialtyType) || (requestSpecialtyAmount === 0 && requestSpecialtyType)) {
+      toast({ title: "요청 특산물 타입/수량을 확인해주세요", variant: "destructive" });
+      return;
+    }
+    if ((offerUnitAmount > 0 && !offerUnitType) || (offerUnitAmount === 0 && offerUnitType)) {
+      toast({ title: "제안 병력 타입/수량을 확인해주세요", variant: "destructive" });
+      return;
+    }
+    if ((requestUnitAmount > 0 && !requestUnitType) || (requestUnitAmount === 0 && requestUnitType)) {
+      toast({ title: "요청 병력 타입/수량을 확인해주세요", variant: "destructive" });
+      return;
+    }
+
+    if (
+      (offerGold === 0 && offerFood === 0 && offerSpecialtyAmount === 0 && offerUnitAmount === 0) ||
+      (requestGold === 0 && requestFood === 0 && requestSpecialtyAmount === 0 && requestUnitAmount === 0)
+    ) {
       toast({ title: "제안과 요청에 자원을 넣어주세요", variant: "destructive" });
       return;
     }
@@ -68,16 +148,38 @@ export function TradePanel({ roomId, currentPlayerId, players, myGold, myFood }:
     try {
       await apiRequest("POST", `/api/rooms/${roomId}/trades/propose`, {
         targetPlayerId: proposeTargetId,
-        offer: { gold: offerGold, food: offerFood },
-        request: { gold: requestGold, food: requestFood },
+        offer: {
+          gold: offerGold,
+          food: offerFood,
+          specialtyType: offerSpecialtyType || undefined,
+          specialtyAmount: offerSpecialtyAmount,
+          unitType: offerUnitType || undefined,
+          unitAmount: offerUnitAmount,
+        },
+        request: {
+          gold: requestGold,
+          food: requestFood,
+          specialtyType: requestSpecialtyType || undefined,
+          specialtyAmount: requestSpecialtyAmount,
+          unitType: requestUnitType || undefined,
+          unitAmount: requestUnitAmount,
+        },
       });
       toast({ title: "거래 제안을 보냈습니다" });
       // Reset form
       setProposeTargetId(null);
       setOfferGold(0);
       setOfferFood(0);
+      setOfferSpecialtyType("");
+      setOfferSpecialtyAmount(0);
+      setOfferUnitType("");
+      setOfferUnitAmount(0);
       setRequestGold(0);
       setRequestFood(0);
+      setRequestSpecialtyType("");
+      setRequestSpecialtyAmount(0);
+      setRequestUnitType("");
+      setRequestUnitAmount(0);
       await fetchTrades();
     } catch (e: any) {
       toast({ title: "제안 실패", description: e.message, variant: "destructive" });
@@ -94,11 +196,70 @@ export function TradePanel({ roomId, currentPlayerId, players, myGold, myFood }:
     }
   };
 
+  const openCounter = (t: Trade) => {
+    setCounterTradeId(t.id);
+    setCounterOfferGold(0);
+    setCounterOfferFood(0);
+    setCounterOfferSpecialtyType("");
+    setCounterOfferSpecialtyAmount(0);
+    setCounterOfferUnitType("");
+    setCounterOfferUnitAmount(0);
+  };
+
+  const submitCounter = async (t: Trade) => {
+    if (!counterTradeId || counterTradeId !== t.id) return;
+
+    if (
+      counterOfferGold < 0 ||
+      counterOfferFood < 0 ||
+      counterOfferSpecialtyAmount < 0 ||
+      counterOfferUnitAmount < 0
+    ) {
+      toast({ title: "자원은 0 이상이어야 합니다", variant: "destructive" });
+      return;
+    }
+
+    if ((counterOfferSpecialtyAmount > 0 && !counterOfferSpecialtyType) || (counterOfferSpecialtyAmount === 0 && counterOfferSpecialtyType)) {
+      toast({ title: "역제안 특산물 타입/수량을 확인해주세요", variant: "destructive" });
+      return;
+    }
+    if ((counterOfferUnitAmount > 0 && !counterOfferUnitType) || (counterOfferUnitAmount === 0 && counterOfferUnitType)) {
+      toast({ title: "역제안 병력 타입/수량을 확인해주세요", variant: "destructive" });
+      return;
+    }
+
+    if (counterOfferGold === 0 && counterOfferFood === 0 && counterOfferSpecialtyAmount === 0 && counterOfferUnitAmount === 0) {
+      toast({ title: "역제안할 내용을 입력해주세요", variant: "destructive" });
+      return;
+    }
+
+    try {
+      await apiRequest("POST", `/api/rooms/${roomId}/trades/${t.id}/respond`, {
+        action: "counter",
+        counterOffer: {
+          gold: counterOfferGold,
+          food: counterOfferFood,
+          specialtyType: counterOfferSpecialtyType || undefined,
+          specialtyAmount: counterOfferSpecialtyAmount,
+          unitType: counterOfferUnitType || undefined,
+          unitAmount: counterOfferUnitAmount,
+        },
+      });
+      toast({ title: "역제안을 보냈습니다" });
+      setCounterTradeId(null);
+      await fetchTrades();
+    } catch (e: any) {
+      toast({ title: "역제안 실패", description: e.message, variant: "destructive" });
+    }
+  };
+
   const statusColor = (s: TradeStatus) => {
     switch (s) {
       case "proposed": return "bg-yellow-500";
       case "accepted": case "completed": return "bg-green-500";
       case "rejected": case "countered": return "bg-red-500";
+      case "failed": return "bg-red-500";
+      case "expired": return "bg-gray-500";
       default: return "bg-gray-500";
     }
   };
@@ -110,6 +271,8 @@ export function TradePanel({ roomId, currentPlayerId, players, myGold, myFood }:
       case "rejected": return "거절됨";
       case "countered": return "역제안됨";
       case "completed": return "체결됨";
+      case "failed": return "실패";
+      case "expired": return "만료";
       default: return s;
     }
   };
@@ -118,8 +281,23 @@ export function TradePanel({ roomId, currentPlayerId, players, myGold, myFood }:
 
   const playerLabel = (p: GamePlayer) => p.nationId || `Player ${p.id}`;
 
+  const filteredTrades = useMemo(() => {
+    return trades.filter((t) => {
+      if (statusFilter === "all") return true;
+      if (statusFilter === "completed") return t.status === "completed";
+      if (statusFilter === "failed") return t.status === "failed";
+      if (statusFilter === "expired") return t.status === "expired";
+      if (statusFilter === "rejected") return t.status === "rejected";
+      if (statusFilter === "countered") return t.status === "countered";
+      if (statusFilter === "active") return t.status === "proposed" || t.status === "accepted";
+      if (statusFilter === "action_required") return t.status === "proposed" && t.responderId === currentPlayerId;
+      return true;
+    });
+  }, [trades, statusFilter, currentPlayerId]);
+
   return (
-    <div className="space-y-4">
+    <ScrollArea className="h-full">
+      <div className="space-y-4 p-1">
       {/* 제안 폼 */}
       <Card>
         <CardHeader>
@@ -156,12 +334,96 @@ export function TradePanel({ roomId, currentPlayerId, players, myGold, myFood }:
 
           <div className="grid grid-cols-2 gap-4">
             <div>
+              <Label>제안할 특산물</Label>
+              <Select value={offerSpecialtyType} onValueChange={(v) => setOfferSpecialtyType(v as any)}>
+                <SelectTrigger>
+                  <SelectValue placeholder="선택 안함" />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="">선택 안함</SelectItem>
+                  {(Object.keys(SpecialtyStats) as SpecialtyType[]).map((k) => (
+                    <SelectItem key={k} value={k}>{SpecialtyStats[k].nameKo}</SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+            </div>
+            <div>
+              <Label>제안 특산물 수량</Label>
+              <Input type="number" min={0} value={offerSpecialtyAmount} onChange={(e) => setOfferSpecialtyAmount(Number(e.target.value))} />
+            </div>
+          </div>
+
+          <div className="grid grid-cols-2 gap-4">
+            <div>
+              <Label>제안할 병력</Label>
+              <Select value={offerUnitType} onValueChange={(v) => setOfferUnitType(v as any)}>
+                <SelectTrigger>
+                  <SelectValue placeholder="선택 안함" />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="">선택 안함</SelectItem>
+                  {( ["infantry","cavalry","archer","siege","navy","spy"] as UnitTypeDB[] ).map((k) => (
+                    <SelectItem key={k} value={k}>{unitTypeLabels[k]}</SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+            </div>
+            <div>
+              <Label>제안 병력 수량</Label>
+              <Input type="number" min={0} value={offerUnitAmount} onChange={(e) => setOfferUnitAmount(Number(e.target.value))} />
+            </div>
+          </div>
+
+          <div className="grid grid-cols-2 gap-4">
+            <div>
               <Label>요청할 금</Label>
               <Input type="number" min={0} value={requestGold} onChange={(e) => setRequestGold(Number(e.target.value))} />
             </div>
             <div>
               <Label>요청할 식량</Label>
               <Input type="number" min={0} value={requestFood} onChange={(e) => setRequestFood(Number(e.target.value))} />
+            </div>
+          </div>
+
+          <div className="grid grid-cols-2 gap-4">
+            <div>
+              <Label>요청할 특산물</Label>
+              <Select value={requestSpecialtyType} onValueChange={(v) => setRequestSpecialtyType(v as any)}>
+                <SelectTrigger>
+                  <SelectValue placeholder="선택 안함" />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="">선택 안함</SelectItem>
+                  {(Object.keys(SpecialtyStats) as SpecialtyType[]).map((k) => (
+                    <SelectItem key={k} value={k}>{SpecialtyStats[k].nameKo}</SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+            </div>
+            <div>
+              <Label>요청 특산물 수량</Label>
+              <Input type="number" min={0} value={requestSpecialtyAmount} onChange={(e) => setRequestSpecialtyAmount(Number(e.target.value))} />
+            </div>
+          </div>
+
+          <div className="grid grid-cols-2 gap-4">
+            <div>
+              <Label>요청할 병력</Label>
+              <Select value={requestUnitType} onValueChange={(v) => setRequestUnitType(v as any)}>
+                <SelectTrigger>
+                  <SelectValue placeholder="선택 안함" />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="">선택 안함</SelectItem>
+                  {( ["infantry","cavalry","archer","siege","navy","spy"] as UnitTypeDB[] ).map((k) => (
+                    <SelectItem key={k} value={k}>{unitTypeLabels[k]}</SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+            </div>
+            <div>
+              <Label>요청 병력 수량</Label>
+              <Input type="number" min={0} value={requestUnitAmount} onChange={(e) => setRequestUnitAmount(Number(e.target.value))} />
             </div>
           </div>
 
@@ -176,14 +438,38 @@ export function TradePanel({ roomId, currentPlayerId, players, myGold, myFood }:
           <CardDescription>내가 관여한 거래 목록입니다</CardDescription>
         </CardHeader>
         <CardContent>
-          {trades.length === 0 ? (
+          <div className="flex items-center justify-between gap-2 mb-3">
+            <Label className="text-sm">필터</Label>
+            <Select value={statusFilter} onValueChange={(v) => setStatusFilter(v as any)}>
+              <SelectTrigger className="w-48">
+                <SelectValue placeholder="전체" />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value="all">전체</SelectItem>
+                <SelectItem value="action_required">내가 응답해야 함</SelectItem>
+                <SelectItem value="active">진행중</SelectItem>
+                <SelectItem value="completed">완료</SelectItem>
+                <SelectItem value="failed">실패</SelectItem>
+                <SelectItem value="expired">만료</SelectItem>
+                <SelectItem value="rejected">거절</SelectItem>
+                <SelectItem value="countered">역제안됨(종료)</SelectItem>
+              </SelectContent>
+            </Select>
+          </div>
+
+          {filteredTrades.length === 0 ? (
             <p className="text-muted-foreground">거래 내역이 없습니다</p>
           ) : (
             <div className="space-y-3">
-              {trades.map((t) => {
+              {filteredTrades.map((t) => {
                 const isProposer = t.proposerId === currentPlayerId;
                 const other = players.find((p) => p.id === (isProposer ? t.responderId : t.proposerId));
                 const canRespond = !isProposer && t.status === "proposed";
+                const canCounter = canRespond;
+
+                const proposedTurn = t.proposedTurn ?? null;
+                const expiresAtTurn = proposedTurn != null ? (proposedTurn + tradeExpireAfterTurns) : null;
+                const remainingTurns = expiresAtTurn != null ? (expiresAtTurn - roomTurn) : null;
 
                 return (
                   <div key={t.id} className="border rounded-lg p-3 space-y-2">
@@ -195,15 +481,109 @@ export function TradePanel({ roomId, currentPlayerId, players, myGold, myFood }:
                       <Badge className={statusColor(t.status)}>{statusText(t.status)}</Badge>
                     </div>
 
+                    {t.status === "proposed" && expiresAtTurn != null && (
+                      <div className="text-xs text-muted-foreground">
+                        만료: T{expiresAtTurn}
+                        {remainingTurns != null && (
+                          <span>{` (남은 ${remainingTurns}턴)`}</span>
+                        )}
+                      </div>
+                    )}
+
+                    {t.status === "accepted" && (
+                      <div className="text-xs text-muted-foreground">체결 대기: 턴 종료 시 처리</div>
+                    )}
+
                     <div className="text-sm space-y-1">
                       <div>제안: 금 {t.offerGold} / 식량 {t.offerFood}</div>
+                      {(t.offerSpecialtyType || (t.offerSpecialtyAmount ?? 0) > 0) && (
+                        <div>제안: 특산물 {t.offerSpecialtyType ? SpecialtyStats[t.offerSpecialtyType as SpecialtyType]?.nameKo ?? t.offerSpecialtyType : "-"} / 수량 {t.offerSpecialtyAmount ?? 0}</div>
+                      )}
+                      {(t.offerUnitType || (t.offerUnitAmount ?? 0) > 0) && (
+                        <div>제안: 병력 {t.offerUnitType ? (unitTypeLabels[t.offerUnitType as UnitTypeDB] ?? t.offerUnitType) : "-"} / 수량 {t.offerUnitAmount ?? 0}</div>
+                      )}
                       <div>요청: 금 {t.requestGold} / 식량 {t.requestFood}</div>
+                      {(t.requestSpecialtyType || (t.requestSpecialtyAmount ?? 0) > 0) && (
+                        <div>요청: 특산물 {t.requestSpecialtyType ? SpecialtyStats[t.requestSpecialtyType as SpecialtyType]?.nameKo ?? t.requestSpecialtyType : "-"} / 수량 {t.requestSpecialtyAmount ?? 0}</div>
+                      )}
+                      {(t.requestUnitType || (t.requestUnitAmount ?? 0) > 0) && (
+                        <div>요청: 병력 {t.requestUnitType ? (unitTypeLabels[t.requestUnitType as UnitTypeDB] ?? t.requestUnitType) : "-"} / 수량 {t.requestUnitAmount ?? 0}</div>
+                      )}
                     </div>
 
                     {canRespond && (
                       <div className="flex gap-2">
                         <Button size="sm" onClick={() => handleRespond(t.id, "accept")}>수락</Button>
                         <Button size="sm" variant="destructive" onClick={() => handleRespond(t.id, "reject")}>거절</Button>
+                        <Button size="sm" variant="outline" onClick={() => openCounter(t)}>역제안</Button>
+                      </div>
+                    )}
+
+                    {canCounter && counterTradeId === t.id && (
+                      <div className="border rounded-md p-3 space-y-3">
+                        <div className="text-sm font-medium">역제안 (내가 주는 조건)</div>
+
+                        <div className="grid grid-cols-2 gap-3">
+                          <div>
+                            <Label>금</Label>
+                            <Input type="number" min={0} value={counterOfferGold} onChange={(e) => setCounterOfferGold(Number(e.target.value))} />
+                          </div>
+                          <div>
+                            <Label>식량</Label>
+                            <Input type="number" min={0} value={counterOfferFood} onChange={(e) => setCounterOfferFood(Number(e.target.value))} />
+                          </div>
+                        </div>
+
+                        <div className="grid grid-cols-2 gap-3">
+                          <div>
+                            <Label>특산물</Label>
+                            <Select value={counterOfferSpecialtyType} onValueChange={(v) => setCounterOfferSpecialtyType(v as any)}>
+                              <SelectTrigger>
+                                <SelectValue placeholder="선택 안함" />
+                              </SelectTrigger>
+                              <SelectContent>
+                                <SelectItem value="">선택 안함</SelectItem>
+                                {(Object.keys(SpecialtyStats) as SpecialtyType[]).map((k) => (
+                                  <SelectItem key={k} value={k}>{SpecialtyStats[k].nameKo}</SelectItem>
+                                ))}
+                              </SelectContent>
+                            </Select>
+                          </div>
+                          <div>
+                            <Label>특산물 수량</Label>
+                            <Input type="number" min={0} value={counterOfferSpecialtyAmount} onChange={(e) => setCounterOfferSpecialtyAmount(Number(e.target.value))} />
+                          </div>
+                        </div>
+
+                        <div className="grid grid-cols-2 gap-3">
+                          <div>
+                            <Label>병력</Label>
+                            <Select value={counterOfferUnitType} onValueChange={(v) => setCounterOfferUnitType(v as any)}>
+                              <SelectTrigger>
+                                <SelectValue placeholder="선택 안함" />
+                              </SelectTrigger>
+                              <SelectContent>
+                                <SelectItem value="">선택 안함</SelectItem>
+                                {( ["infantry","cavalry","archer","siege","navy","spy"] as UnitTypeDB[] ).map((k) => (
+                                  <SelectItem key={k} value={k}>{unitTypeLabels[k]}</SelectItem>
+                                ))}
+                              </SelectContent>
+                            </Select>
+                          </div>
+                          <div>
+                            <Label>병력 수량</Label>
+                            <Input type="number" min={0} value={counterOfferUnitAmount} onChange={(e) => setCounterOfferUnitAmount(Number(e.target.value))} />
+                          </div>
+                        </div>
+
+                        <div className="text-xs text-muted-foreground">
+                          (상대에게는 기존 제안에서 당신이 요청받은 항목을 그대로 요청합니다)
+                        </div>
+
+                        <div className="flex gap-2">
+                          <Button size="sm" onClick={() => submitCounter(t)}>역제안 제출</Button>
+                          <Button size="sm" variant="outline" onClick={() => setCounterTradeId(null)}>닫기</Button>
+                        </div>
                       </div>
                     )}
                   </div>
@@ -213,6 +593,7 @@ export function TradePanel({ roomId, currentPlayerId, players, myGold, myFood }:
           )}
         </CardContent>
       </Card>
-    </div>
+      </div>
+    </ScrollArea>
   );
 }

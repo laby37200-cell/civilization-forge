@@ -67,6 +67,7 @@ export const gameRooms = pgTable("game_rooms", {
   mapHeight: integer("map_height").default(30),
   aiPlayerCount: integer("ai_player_count").default(0),
   aiDifficulty: text("ai_difficulty").$type<AIDifficulty>(),
+  tradeExpireAfterTurns: integer("trade_expire_after_turns").default(3),
   createdAt: timestamp("created_at").defaultNow(),
   lastActiveAt: timestamp("last_active_at").defaultNow(),
   inactiveSince: timestamp("inactive_since"),
@@ -81,6 +82,21 @@ export const insertGameRoomSchema = createInsertSchema(gameRooms).pick({
 
 export type InsertGameRoom = z.infer<typeof insertGameRoomSchema>;
 export type GameRoom = typeof gameRooms.$inferSelect;
+
+// === GAME NATIONS (DB-backed nations for civil war / dynamic factions) ===
+export const gameNations = pgTable("game_nations", {
+  id: serial("id").primaryKey(),
+  gameId: integer("game_id").references(() => gameRooms.id),
+  nationId: text("nation_id").notNull(),
+  name: text("name").notNull(),
+  nameKo: text("name_ko").notNull(),
+  color: text("color").notNull(),
+  isDynamic: boolean("is_dynamic").default(false),
+  createdTurn: integer("created_turn").default(0),
+  createdAt: timestamp("created_at").defaultNow(),
+});
+
+export type GameNation = typeof gameNations.$inferSelect;
 
 // === PLAYERS IN GAME ===
 
@@ -169,7 +185,7 @@ export type InsertCity = z.infer<typeof insertCitySchema>;
 export type City = typeof cities.$inferSelect;
 
 // === TURN ACTIONS ===
-export type ActionType = "move" | "attack" | "build" | "recruit" | "trade";
+export type ActionType = "move" | "attack" | "build" | "recruit" | "trade" | "defense" | "civil_war";
 
 export const turnActions = pgTable("turn_actions", {
   id: serial("id").primaryKey(),
@@ -234,6 +250,10 @@ export const diplomacy = pgTable("diplomacy", {
   status: text("status").notNull().$type<DiplomacyStatusDB>().default("neutral"),
   favorability: integer("favorability").default(50),
   lastChanged: timestamp("last_changed").defaultNow(),
+  // 턴 종료 처리용: 외교 제안 상태
+  pendingStatus: text("pending_status").$type<DiplomacyStatusDB>(),
+  pendingRequesterId: integer("pending_requester_id").references(() => gamePlayers.id),
+  pendingTurn: integer("pending_turn"),
 });
 
 export type Diplomacy = typeof diplomacy.$inferSelect;
@@ -251,7 +271,7 @@ export const specialties = pgTable("specialties", {
 export type Specialty = typeof specialties.$inferSelect;
 
 // === 거래 시스템 TRADES ===
-export type TradeStatus = "proposed" | "accepted" | "rejected" | "countered" | "completed";
+export type TradeStatus = "proposed" | "accepted" | "rejected" | "countered" | "completed" | "failed" | "expired";
 
 export const trades = pgTable("trades", {
   id: serial("id").primaryKey(),
@@ -687,6 +707,9 @@ export interface DiplomacyData {
   playerId2: string;
   status: DiplomacyStatus;
   favorability: number;
+  pendingStatus?: DiplomacyStatus | null;
+  pendingRequesterId?: string | null;
+  pendingTurn?: number | null;
 }
 
 export type DiplomacyStatus = "alliance" | "friendly" | "neutral" | "hostile" | "war";

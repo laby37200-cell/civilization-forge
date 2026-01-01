@@ -4,11 +4,14 @@ import { Badge } from "@/components/ui/badge";
 import { Progress } from "@/components/ui/progress";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { Separator } from "@/components/ui/separator";
+import { Textarea } from "@/components/ui/textarea";
+import { Input } from "@/components/ui/input";
 import { 
   Building2, Castle, Home, Tent, Users, Coins, Wheat, Package,
   Smile, Frown, Meh, Swords, Hammer, Eye
 } from "lucide-react";
 import { cn } from "@/lib/utils";
+import { useState } from "react";
 import type { CityData, CityGrade, BuildingType, TroopData, UnitType } from "@shared/schema";
 
 interface CityPanelProps {
@@ -18,6 +21,8 @@ interface CityPanelProps {
   onBuild: () => void;
   onRecruit: () => void;
   onManage: () => void;
+  onSubmitDefenseStrategy?: (cityId: number, strategy: string) => void;
+  onSubmitCivilWar?: (payload: { nameKo: string; name?: string; color?: string }) => void;
 }
 
 const unitLabels: Record<UnitType, string> = {
@@ -91,7 +96,7 @@ function HappinessIndicator({ happiness }: { happiness: number }) {
   );
 }
 
-export function CityPanel({ city, troops, buildings, onBuild, onRecruit, onManage }: CityPanelProps) {
+export function CityPanel({ city, troops, buildings, onBuild, onRecruit, onManage, onSubmitDefenseStrategy, onSubmitCivilWar }: CityPanelProps) {
   if (!city) {
     return (
       <Card className="h-full">
@@ -113,6 +118,9 @@ export function CityPanel({ city, troops, buildings, onBuild, onRecruit, onManag
   };
   const totalTroops = Object.values(safeTroops).reduce((a, b) => a + b, 0);
   const troopEntries = (Object.entries(safeTroops) as Array<[UnitType, number]>).filter(([, v]) => v > 0);
+
+  const [defenseStrategy, setDefenseStrategy] = useState("");
+  const [civilWarNameKo, setCivilWarNameKo] = useState("");
 
   return (
     <Card className="h-full flex flex-col" data-testid="city-panel">
@@ -222,6 +230,65 @@ export function CityPanel({ city, troops, buildings, onBuild, onRecruit, onManag
             <div className="flex items-center gap-2 text-sm text-muted-foreground">
               <Eye className="w-4 h-4" />
               <span>첩보력: {city.spyPower}</span>
+            </div>
+
+            <Separator />
+
+            <div className="space-y-2">
+              <div className="flex items-center justify-between">
+                <h4 className="text-sm font-medium flex items-center gap-1">
+                  <Swords className="w-4 h-4" />
+                  방어 전략
+                </h4>
+              </div>
+              <Textarea
+                value={defenseStrategy}
+                onChange={(e) => setDefenseStrategy(e.target.value)}
+                placeholder="이번 턴 방어 전략을 입력하세요 (공격받을 때 적용)"
+                className="min-h-[72px]"
+              />
+              <Button
+                size="sm"
+                variant="secondary"
+                className="w-full"
+                disabled={!onSubmitDefenseStrategy}
+                onClick={() => {
+                  if (!onSubmitDefenseStrategy) return;
+                  const cityIdNum = Number(city.id);
+                  if (!Number.isFinite(cityIdNum)) return;
+                  onSubmitDefenseStrategy(cityIdNum, defenseStrategy);
+                }}
+              >
+                방어 전략 제출
+              </Button>
+            </div>
+
+            <Separator />
+
+            <div className="space-y-2">
+              <div className="flex items-center justify-between">
+                <h4 className="text-sm font-medium flex items-center gap-1">
+                  <Swords className="w-4 h-4" />
+                  내전/독립
+                </h4>
+              </div>
+              <Input
+                value={civilWarNameKo}
+                onChange={(e) => setCivilWarNameKo(e.target.value)}
+                placeholder="독립 국가명(한글)"
+              />
+              <Button
+                size="sm"
+                variant="destructive"
+                className="w-full"
+                disabled={!onSubmitCivilWar || !civilWarNameKo.trim()}
+                onClick={() => {
+                  if (!onSubmitCivilWar) return;
+                  onSubmitCivilWar({ nameKo: civilWarNameKo.trim() });
+                }}
+              >
+                독립 선언 제출
+              </Button>
             </div>
           </div>
         </ScrollArea>

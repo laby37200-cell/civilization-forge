@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { useLocation, useRoute } from "wouter";
 import { Button } from "@/components/ui/button";
+import { Badge } from "@/components/ui/badge";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import {
   Menu,
@@ -66,56 +67,11 @@ import type {
   Spy,
   SpyMission,
   SpyLocationType,
+  Trade,
+  GameNation,
 } from "@shared/schema";
 import { NationsInitialData, SpecialtyStats, CityGradeStats, UnitStats, BuildingStats } from "@shared/schema";
 
-const mockPlayers: PlayerData[] = [
-  {
-    id: "player1",
-    oderId: "user1",
-    name: "DragonKing",
-    avatarUrl: null,
-    isAI: false,
-    aiDifficulty: null,
-    nationId: "korea",
-    cities: ["city_0,0", "city_2,-1"],
-    isOnline: true,
-    isReady: true,
-    totalTroops: 5500,
-    totalGold: 25000,
-    score: 450,
-  },
-  {
-    id: "player2",
-    oderId: "user2",
-    name: "SamuraiMaster",
-    avatarUrl: null,
-    isAI: false,
-    aiDifficulty: null,
-    nationId: "japan",
-    cities: ["city_-2,2"],
-    isOnline: true,
-    isReady: true,
-    totalTroops: 4200,
-    totalGold: 18000,
-    score: 320,
-  },
-  {
-    id: "ai1",
-    oderId: "ai1",
-    name: "AI 영주",
-    avatarUrl: null,
-    isAI: true,
-    aiDifficulty: "normal",
-    nationId: "china",
-    cities: [],
-    isOnline: true,
-    isReady: true,
-    totalTroops: 3000,
-    totalGold: 15000,
-    score: 200,
-  },
-];
 
 const mockDiplomacy: DiplomacyData[] = [
   { playerId1: "player1", playerId2: "player2", status: "neutral", favorability: 10 },
@@ -139,6 +95,7 @@ export default function Game() {
   const [buildings, setBuildings] = useState<Building[]>([]);
   const [specialties, setSpecialties] = useState<Specialty[]>([]);
   const [spies, setSpies] = useState<Spy[]>([]);
+  const [nations, setNations] = useState<GameNation[]>([]);
   const [selectedTileId, setSelectedTileId] = useState<number | null>(null);
   const [currentTurn, setCurrentTurn] = useState(1);
   const [turnEndTime, setTurnEndTime] = useState<number | null>(null);
@@ -167,14 +124,14 @@ export default function Game() {
   const [recruitUnitType, setRecruitUnitType] = useState<UnitType>("infantry");
   const [recruitCount, setRecruitCount] = useState<number>(100);
 
-  const [diplomacy, setDiplomacy] = useState<any[]>([]);
+  const [diplomacy, setDiplomacy] = useState<DiplomacyData[]>([]);
 
   const loadDiplomacy = useCallback(async () => {
     if (!roomId) return;
     try {
       const res = await apiRequest("GET", `/api/rooms/${roomId}/diplomacy`);
       const data = await res.json();
-      setDiplomacy(data);
+      setDiplomacy(data as DiplomacyData[]);
     } catch (e) {
       console.error("Failed to load diplomacy:", e);
     }
@@ -245,6 +202,7 @@ export default function Game() {
         const roomJson = (await roomRes.json()) as {
           room: { turnDuration: number | null; currentTurn: number | null; turnEndTime: number | null };
           players: GamePlayer[];
+          nations?: GameNation[];
           cities: City[];
           tiles: HexTile[];
           units?: Unit[];
@@ -259,6 +217,7 @@ export default function Game() {
         setTiles(roomJson.tiles ?? []);
         setCities(roomJson.cities ?? []);
         setPlayers(roomJson.players ?? []);
+        setNations(roomJson.nations ?? []);
         setUnits(roomJson.units ?? []);
         setBuildings(roomJson.buildings ?? []);
         setSpecialties(roomJson.specialties ?? []);
@@ -305,6 +264,64 @@ export default function Game() {
     if (!currentUser) return null;
     return players.find((p) => p.oderId === currentUser.id) ?? null;
   }, [players, currentUser]);
+
+  const pendingDiplomacyCount = useMemo(() => {
+    const myId = currentPlayer?.id;
+    if (!myId) return 0;
+    const myIdStr = String(myId);
+    return diplomacy.filter((d) => {
+      if (!d.pendingStatus) return false;
+      if (!d.pendingRequesterId) return false;
+      if (String(d.pendingRequesterId) === myIdStr) return false;
+      return d.playerId1 === myIdStr || d.playerId2 === myIdStr;
+    }).length;
+  }, [diplomacy, currentPlayer]);
+
+  const [pendingTradeCount, setPendingTradeCount] = useState(0);
+
+  const [lastEspionageSeenAt, setLastEspionageSeenAt] = useState<number>(0);
+
+  useEffect(() => {
+    if (activeTab === "espionage") {
+      setLastEspionageSeenAt(Date.now());
+    }
+  }, [activeTab]);
+
+  const pendingEspionageCount = useMemo(() => {
+    const myId = currentPlayer?.id;
+    if (!myId) return 0;
+    const myIdStr = String(myId);
+    return news.filter((n) => {
+      if (n.category !== "espionage") return false;
+      if (!Array.isArray(n.involvedPlayers) || !n.involvedPlayers.includes(myIdStr)) return false;
+      return (n.timestamp ?? 0) > lastEspionageSeenAt;
+    }).length;
+  }, [news, currentPlayer, lastEspionageSeenAt]);
+
+  const loadPendingTradeCount = useCallback(async () => {
+    if (!roomId || !currentUser) {
+      setPendingTradeCount(0);
+      return;
+    }
+
+    const playerId = players.find((p) => p.oderId === currentUser.id)?.id ?? null;
+    if (!playerId) {
+      setPendingTradeCount(0);
+      return;
+    }
+    try {
+      const res = await apiRequest("GET", `/api/rooms/${roomId}/trades`);
+      const list = (await res.json()) as Trade[];
+      const count = list.filter((t) => t.responderId === playerId && t.status === "proposed").length;
+      setPendingTradeCount(count);
+    } catch {
+      setPendingTradeCount(0);
+    }
+  }, [roomId, currentUser, players]);
+
+  useEffect(() => {
+    loadPendingTradeCount();
+  }, [loadPendingTradeCount]);
 
   const currentPlayerCities = useMemo(() => {
     if (!currentPlayer) return [];
@@ -365,8 +382,10 @@ export default function Game() {
 
   const playerNation = useMemo(() => {
     if (!currentPlayer?.nationId) return null;
+    const row = nations.find((n) => n.nationId === currentPlayer.nationId) ?? null;
+    if (row) return { id: row.nationId, name: row.name, nameKo: row.nameKo, color: row.color };
     return NationsInitialData.find((n) => n.id === currentPlayer.nationId) ?? null;
-  }, [currentPlayer]);
+  }, [currentPlayer, nations]);
 
   const playerColor = playerNation?.color ?? "#1E90FF";
 
@@ -374,6 +393,11 @@ export default function Game() {
     if (!currentPlayer) return [];
     return cities.filter((c) => c.ownerId === currentPlayer.id);
   }, [cities, currentPlayer]);
+
+  const focusTileId = useMemo(() => {
+    const firstCity = myCities.find((c) => c.centerTileId != null) ?? null;
+    return firstCity?.centerTileId ?? null;
+  }, [myCities]);
 
   useEffect(() => {
     if (!roomId || !currentUser || !currentPlayer) return;
@@ -397,6 +421,7 @@ export default function Game() {
     const roomJson = (await roomRes.json()) as {
       room: { turnDuration: number | null; currentTurn: number | null; turnEndTime: number | null };
       players: GamePlayer[];
+      nations?: GameNation[];
       cities: City[];
       tiles: HexTile[];
       units?: Unit[];
@@ -414,13 +439,18 @@ export default function Game() {
     setTiles(roomJson.tiles ?? []);
     setCities(roomJson.cities ?? []);
     setPlayers(roomJson.players ?? []);
+    setNations(roomJson.nations ?? []);
     setUnits(roomJson.units ?? []);
     setBuildings(roomJson.buildings ?? []);
     setSpecialties(roomJson.specialties ?? []);
     setSpies(roomJson.spies ?? []);
     setNews(roomJson.news ?? []);
     setMessages(roomJson.chat ?? []);
-  }, [roomId]);
+
+    // 탭 배지 갱신 (거래 패널 외부에서 제안이 들어오는 경우 대비)
+    await loadDiplomacy();
+    await loadPendingTradeCount();
+  }, [roomId, loadDiplomacy, loadPendingTradeCount]);
 
   const getTroopsForTile = useCallback((tileId: number, ownerId: number | null): TroopData => {
     const base: TroopData = { infantry: 0, cavalry: 0, archer: 0, siege: 0, navy: 0, spy: 0 };
@@ -435,20 +465,26 @@ export default function Game() {
 
   const nationCapacity = useMemo(() => {
     const capacity: Record<string, { total: number; used: number }> = {};
-    for (const nation of NationsInitialData) {
+    const list = nations.length > 0
+      ? nations.map((n) => ({ id: n.nationId, nameKo: n.nameKo, name: n.name, color: n.color }))
+      : NationsInitialData;
+    for (const nation of list) {
       const totalCities = cities.filter((c) => c.nationId === nation.id).length;
       const usedCities = cities.filter((c) => c.nationId === nation.id && c.ownerId !== null).length;
       capacity[nation.id] = { total: totalCities, used: usedCities };
     }
     return capacity;
-  }, [cities]);
+  }, [cities, nations]);
 
   const availableNations = useMemo(() => {
-    return NationsInitialData.filter((n) => {
+    const list = nations.length > 0
+      ? nations.map((n) => ({ id: n.nationId, nameKo: n.nameKo, name: n.name, color: n.color }))
+      : NationsInitialData;
+    return list.filter((n) => {
       const cap = nationCapacity[n.id];
       return cap && cap.used < cap.total;
     });
-  }, [nationCapacity]);
+  }, [nationCapacity, nations]);
 
   const availableCities = useMemo(() => {
     if (!currentPlayer?.nationId) {
@@ -717,7 +753,13 @@ export default function Game() {
       await apiRequest("POST", `/api/rooms/${roomId}/select_nation`, {
         nationId: selectedNationId,
       });
-      const nation = NationsInitialData.find((n) => n.id === selectedNationId);
+      const nation =
+        (nations.find((n) => n.nationId === selectedNationId)
+          ? {
+              id: selectedNationId,
+              color: nations.find((n) => n.nationId === selectedNationId)!.color,
+            }
+          : NationsInitialData.find((n) => n.id === selectedNationId)) ?? null;
       if (nation) {
         const socket = getSocket();
         socket.emit("select_nation", {
@@ -736,7 +778,7 @@ export default function Game() {
         variant: "destructive",
       });
     }
-  }, [roomId, currentUser, selectedNationId, refetchRoomState, toast]);
+  }, [roomId, currentUser, selectedNationId, nations, refetchRoomState, toast]);
 
   const openMove = useCallback(() => {
     if (!selectedTileId) return;
@@ -953,14 +995,28 @@ export default function Game() {
                 className="flex-1 rounded-none border-b-2 border-transparent data-[state=active]:border-primary"
                 data-testid="tab-diplomacy"
               >
-                <Handshake className="w-4 h-4" />
+                <div className="relative">
+                  <Handshake className="w-4 h-4" />
+                  {pendingDiplomacyCount > 0 && (
+                    <Badge className="absolute -top-2 -right-2 h-4 min-w-4 px-1 flex items-center justify-center text-[10px] leading-none">
+                      {pendingDiplomacyCount}
+                    </Badge>
+                  )}
+                </div>
               </TabsTrigger>
               <TabsTrigger
                 value="espionage"
                 className="flex-1 rounded-none border-b-2 border-transparent data-[state=active]:border-primary"
                 data-testid="tab-espionage"
               >
-                <Eye className="w-4 h-4" />
+                <div className="relative">
+                  <Eye className="w-4 h-4" />
+                  {pendingEspionageCount > 0 && (
+                    <Badge className="absolute -top-2 -right-2 h-4 min-w-4 px-1 flex items-center justify-center text-[10px] leading-none">
+                      {pendingEspionageCount}
+                    </Badge>
+                  )}
+                </div>
               </TabsTrigger>
               <TabsTrigger
                 value="ranking"
@@ -974,7 +1030,14 @@ export default function Game() {
                 className="flex-1 rounded-none border-b-2 border-transparent data-[state=active]:border-primary"
                 data-testid="tab-trade"
               >
-                <Handshake className="w-4 h-4" />
+                <div className="relative">
+                  <Handshake className="w-4 h-4" />
+                  {pendingTradeCount > 0 && (
+                    <Badge className="absolute -top-2 -right-2 h-4 min-w-4 px-1 flex items-center justify-center text-[10px] leading-none">
+                      {pendingTradeCount}
+                    </Badge>
+                  )}
+                </div>
               </TabsTrigger>
             </TabsList>
 
@@ -990,6 +1053,12 @@ export default function Game() {
                   onBuild={handleBuild}
                   onRecruit={handleRecruit}
                   onManage={handleManage}
+                  onSubmitDefenseStrategy={(cityId, strategy) => {
+                    submitTurnAction("defense", { cityId, strategy });
+                  }}
+                  onSubmitCivilWar={(payload) => {
+                    submitTurnAction("civil_war", payload);
+                  }}
                 />
               </TabsContent>
               <TabsContent value="diplomacy" className="h-full m-0 p-4">
@@ -1026,7 +1095,24 @@ export default function Game() {
                 />
               </TabsContent>
               <TabsContent value="ranking" className="h-full m-0 p-4">
-                <Leaderboard players={mockPlayers} currentPlayerId={String(currentUser?.id ?? "")} />
+                <Leaderboard 
+                  players={players.map(p => ({
+                    id: String(p.id),
+                    oderId: String(p.oderId ?? ""),
+                    name: p.nationId ?? `Player ${p.id}`,
+                    avatarUrl: null,
+                    isAI: p.isAI ?? false,
+                    aiDifficulty: p.aiDifficulty ?? null,
+                    nationId: p.nationId ?? "unknown",
+                    cities: [] as string[],
+                    isOnline: true,
+                    isReady: true,
+                    totalTroops: 0,
+                    totalGold: p.gold ?? 0,
+                    score: p.score ?? 0,
+                  } as PlayerData))} 
+                  currentPlayerId={String(currentUser?.id ?? "")} 
+                />
               </TabsContent>
               <TabsContent value="trade" className="h-full m-0 p-4">
                 <TradePanel
@@ -1052,6 +1138,7 @@ export default function Game() {
               onTileClick={handleTileClick}
               playerColor={playerColor}
               currentPlayerId={currentPlayer?.id}
+              focusTileId={focusTileId}
             />
 
             <div className="absolute left-4 top-4 w-80 bg-card/95 backdrop-blur border rounded-md p-3 space-y-2">
@@ -1404,7 +1491,7 @@ export default function Game() {
           </DialogHeader>
 
           <div className="grid grid-cols-2 md:grid-cols-4 gap-2 max-h-80 overflow-y-auto">
-            {NationsInitialData.map((nation) => (
+            {availableNations.map((nation) => (
               <Button
                 key={nation.id}
                 variant={selectedNationId === nation.id ? "default" : "outline"}
