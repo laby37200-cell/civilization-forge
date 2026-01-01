@@ -128,6 +128,104 @@ function calculateStatsScore(input: BattleInput): { attackerPower: number; defen
   return { attackerPower, defenderPower, statsScore };
 }
 
+function normalizeCombat70(attackerPower: number, defenderPower: number): { attacker70: number; defender70: number } {
+  const denom = attackerPower + defenderPower;
+  const attackerRatio = denom > 0 ? attackerPower / denom : 0.5;
+  const attacker70 = 70 * attackerRatio;
+  return { attacker70, defender70: 70 - attacker70 };
+}
+
+function isMeaningfulStrategyText(text: string): boolean {
+  const trimmed = String(text ?? "").trim();
+  if (!trimmed) return false;
+  return trimmed.split(/\s+/).length > 2;
+}
+
+function clampInt(n: number, min: number, max: number): number {
+  const x = Math.floor(n);
+  return Math.max(min, Math.min(max, x));
+}
+
+function randomInRange(min: number, max: number): number {
+  return min + Math.random() * (max - min);
+}
+
+function getLossRatioRangeByPowerRatio(powerRatio: number): { winner: [number, number]; loser: [number, number] } {
+  if (powerRatio >= 2.0) return { winner: [0.10, 0.20], loser: [0.80, 1.00] };
+  if (powerRatio >= 1.5) return { winner: [0.20, 0.30], loser: [0.60, 0.80] };
+  if (powerRatio >= 1.2) return { winner: [0.30, 0.40], loser: [0.50, 0.60] };
+  return { winner: [0.40, 0.50], loser: [0.50, 0.60] };
+}
+
+async function judgeStrategyScores(input: BattleInput, attackerPower: number, defenderPower: number): Promise<{ attacker: number; defender: number; narrative: string }>{
+  const totalTroops = Object.values({ ...input.attackerTroops, ...input.defenderTroops }).reduce((a, b) => a + (b ?? 0), 0);
+  const attackerHasStrategy = isMeaningfulStrategyText(input.attackerStrategy);
+  const defenderHasStrategy = isMeaningfulStrategyText(input.defenderStrategy);
+
+  if (!attackerHasStrategy && !defenderHasStrategy) {
+    return { attacker: 0, defender: 0, narrative: "치열한 전투가 벌어졌습니다." };
+  }
+
+  if (totalTroops < 500) {
+    return { attacker: attackerHasStrategy ? 15 : 0, defender: defenderHasStrategy ? 15 : 0, narrative: "치열한 전투가 벌어졌습니다." };
+  }
+
+  const prompt = `당신은 전략 게임의 전투 심판관입니다. 아래 전투에서 양측의 전략 텍스트를 평가하여 점수만 산출하세요.
+
+## 전투 상황
+- 지형: ${input.terrain}${input.isCity ? ` (도시 방어 레벨: ${input.cityDefenseLevel || 0})` : ""}
+
+## 공격군
+병력: ${JSON.stringify(input.attackerTroops)}
+전략: "${input.attackerStrategy || ""}"
+능력치 기반 전투력(공격): ${attackerPower.toFixed(2)}
+
+## 수비군
+병력: ${JSON.stringify(input.defenderTroops)}
+전략: "${input.defenderStrategy || ""}"
+능력치 기반 전투력(방어): ${defenderPower.toFixed(2)}
+
+## 요청
+1) 공격자 전략 점수(attackerScore)를 0~30 정수로 채점하세요.
+2) 방어자 전략 점수(defenderScore)를 0~30 정수로 채점하세요.
+3) 배점 기준은 다음을 참고하세요:
+- 지형 일치성(0~10)
+- 병과 연계성(0~5)
+- 병법 논리성(0~10)
+- 첩보 카운터(0~5) (방어자에게 특히 중요)
+4) 전략 텍스트가 비어 있거나 1~2단어이면 해당 측 점수는 0점입니다.
+5) 반드시 아래 JSON 형식으로만 응답하세요(반드시 유효한 JSON):
+{"attackerScore": 0, "defenderScore": 0, "narrative": "전투 서술 (2-3문장)"}`;
+
+  let llmResponse = await callGeminiAPI(prompt);
+  if (!llmResponse) {
+    llmResponse = await callDeepseekAPI(prompt);
+  }
+
+  let attackerScore = attackerHasStrategy ? 15 : 0;
+  let defenderScore = defenderHasStrategy ? 15 : 0;
+  let narrative = "치열한 전투가 벌어졌습니다.";
+
+  if (llmResponse) {
+    try {
+      const jsonMatch = llmResponse.match(/\{[\s\S]*\}/);
+      if (jsonMatch) {
+        const parsed = JSON.parse(jsonMatch[0]);
+        if (typeof parsed.attackerScore === "number") attackerScore = clampInt(parsed.attackerScore, 0, 30);
+        if (typeof parsed.defenderScore === "number") defenderScore = clampInt(parsed.defenderScore, 0, 30);
+        if (typeof parsed.narrative === "string" && parsed.narrative.trim()) narrative = parsed.narrative;
+      }
+    } catch (e) {
+      console.error("[LLM] Failed to parse response:", e);
+    }
+  }
+
+  if (!attackerHasStrategy) attackerScore = 0;
+  if (!defenderHasStrategy) defenderScore = 0;
+
+  return { attacker: attackerScore, defender: defenderScore, narrative };
+}
+
 function calculateLosses(
   troops: Record<UnitTypeDB, number>,
   lossRatio: number
@@ -208,89 +306,43 @@ async function callDeepseekAPI(prompt: string): Promise<string | null> {
 }
 
 export async function judgeBattle(input: BattleInput): Promise<BattleResult> {
-  const { attackerPower, defenderPower, statsScore } = calculateStatsScore(input);
+  const { attackerPower, defenderPower } = calculateStatsScore(input);
+  const { attacker70, defender70 } = normalizeCombat70(attackerPower, defenderPower);
+  const strategy = await judgeStrategyScores(input, attackerPower, defenderPower);
 
-  const prompt = `당신은 전략 게임의 전투 심판관입니다. 아래 전투에서 **전략 텍스트의 유효성**을 평가해 점수로만 답하세요.
+  const attackerFinal = attacker70 + strategy.attacker;
+  const defenderFinal = defender70 + strategy.defender;
 
-## 전투 상황
-- 지형: ${input.terrain}${input.isCity ? ` (도시 방어 레벨: ${input.cityDefenseLevel || 0})` : ""}
-
-## 공격군
-병력: ${JSON.stringify(input.attackerTroops)}
-전략: "${input.attackerStrategy || "기본 공격"}"
-능력치 기반 전투력(공격): ${attackerPower.toFixed(2)}
-
-## 수비군
-병력: ${JSON.stringify(input.defenderTroops)}
-전략: "${input.defenderStrategy || "기본 방어"}"
-능력치 기반 전투력(방어): ${defenderPower.toFixed(2)}
-
-## 능력치 기반 우세도
-공격군 우세도(statsScore): ${statsScore.toFixed(4)} (0=수비 압도, 0.5=균형, 1=공격 압도)
-
-## 요청
-1. 전략 텍스트를 아래 세부 항목으로 평가하고, 각 항목을 0~1 점수로 환산后 평균을 내어 strategyScore(0~1)를 계산하세요.
-   - 지형 일치성: 지형에 맞는 병과/전술 사용 여부
-   - 병과 연계성: 보병-기병-궁수 연계 등 조합 전술
-   - 심리전/기만: 거짓 철수/매복 등 심리전 활용
-   - 첩보 활용: 첩보 병과를 통한 정보 우위
-   - 창의성/예측 불가능성: 예상 밖의 전략
-   - 만약 전략이 비어 있거나 1~2 단어라면 0점 처리
-2. 반드시 아래 JSON 형식으로만 응답하세요:
-{"strategyScore": 0.0~1.0, "narrative": "전투 서술 (2-3문장)"}`;
-
-  let llmResponse = await callGeminiAPI(prompt);
-  if (!llmResponse) {
-    llmResponse = await callDeepseekAPI(prompt);
-  }
-
-  // Spec: finalScore = 0.7 * statsScore + 0.3 * strategyScore
-  // GDD 13장: 전략 미입력 시 0점 처리
-  let strategyScore = 0;
-  let narrative = "치열한 전투가 벌어졌습니다.";
-
-  // 전략 미입력 여부 확인 (비어있거나 1~2 단어)
-  const hasAttackerStrategy = input.attackerStrategy && input.attackerStrategy.trim().split(/\s+/).length > 2;
-  const hasDefenderStrategy = input.defenderStrategy && input.defenderStrategy.trim().split(/\s+/).length > 2;
-
-  if (!hasAttackerStrategy && !hasDefenderStrategy) {
-    strategyScore = 0; // 양측 모두 미입력
-  } else if (!hasAttackerStrategy || !hasDefenderStrategy) {
-    strategyScore = 0.2; // 한쪽만 미입력 (소량 페널티)
-  } else {
-    // 양측 모두 전략 입력: LLM 평가
-    if (llmResponse) {
-      try {
-        const jsonMatch = llmResponse.match(/\{[\s\S]*\}/);
-        if (jsonMatch) {
-          const parsed = JSON.parse(jsonMatch[0]);
-          if (typeof parsed.strategyScore === "number") {
-            strategyScore = Math.max(0, Math.min(1, parsed.strategyScore));
-          }
-          if (parsed.narrative) narrative = parsed.narrative;
-        }
-      } catch (e) {
-        console.error("[LLM] Failed to parse response:", e);
-      }
-    }
-  }
-
-  const finalScore = 0.7 * statsScore + 0.3 * strategyScore;
   const winner: "attacker" | "defender" | "draw" =
-    finalScore > 0.55 ? "attacker" : finalScore < 0.45 ? "defender" : "draw";
+    attackerFinal > defenderFinal + 2 ? "attacker" : defenderFinal > attackerFinal + 2 ? "defender" : "draw";
 
-  // Losses scale with how decisive the outcome is.
-  const decisiveness = Math.min(1, Math.abs(finalScore - 0.5) * 2); // 0..1
-  const attackerLossRatio =
-    winner === "attacker" ? 0.12 + 0.10 * (1 - decisiveness) : winner === "defender" ? 0.35 + 0.15 * decisiveness : 0.22;
-  const defenderLossRatio =
-    winner === "defender" ? 0.12 + 0.10 * (1 - decisiveness) : winner === "attacker" ? 0.35 + 0.20 * decisiveness : 0.22;
+  let attackerLossRatio = 0.22;
+  let defenderLossRatio = 0.22;
+
+  if (winner === "attacker" || winner === "defender") {
+    const w = winner === "attacker" ? attackerFinal : defenderFinal;
+    const l = winner === "attacker" ? defenderFinal : attackerFinal;
+    const ratio = l > 0 ? w / l : 99;
+    const ranges = getLossRatioRangeByPowerRatio(ratio);
+    const wLoss = randomInRange(ranges.winner[0], ranges.winner[1]);
+    const lLoss = randomInRange(ranges.loser[0], ranges.loser[1]);
+    if (winner === "attacker") {
+      attackerLossRatio = wLoss;
+      defenderLossRatio = lLoss;
+    } else {
+      attackerLossRatio = lLoss;
+      defenderLossRatio = wLoss;
+    }
+  } else {
+    attackerLossRatio = randomInRange(0.40, 0.50);
+    defenderLossRatio = randomInRange(0.50, 0.60);
+  }
 
   return {
     result: winner === "attacker" ? "attacker_win" : winner === "defender" ? "defender_win" : "draw",
     attackerLosses: calculateLosses(input.attackerTroops, attackerLossRatio),
     defenderLosses: calculateLosses(input.defenderTroops, defenderLossRatio),
-    narrative,
+    narrative: strategy.narrative,
   };
 }
 

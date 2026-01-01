@@ -334,7 +334,7 @@ export const aiMemory = pgTable("ai_memory", {
 export type AIMemory = typeof aiMemory.$inferSelect;
 
 // === AUTO MOVE ORDERS (multi-turn path movement) ===
-export type AutoMoveStatusDB = "active" | "completed" | "canceled";
+export type AutoMoveStatusDB = "active" | "blocked" | "completed" | "canceled";
 
 export const autoMoves = pgTable("auto_moves", {
   id: serial("id").primaryKey(),
@@ -347,6 +347,9 @@ export const autoMoves = pgTable("auto_moves", {
   path: jsonb("path").$type<number[]>().default([]),
   pathIndex: integer("path_index").notNull().default(0),
   status: text("status").notNull().$type<AutoMoveStatusDB>().default("active"),
+  blockedReason: text("blocked_reason"),
+  blockedTileId: integer("blocked_tile_id").references(() => hexTiles.id),
+  blockedTurn: integer("blocked_turn"),
   cancelReason: text("cancel_reason"),
   createdTurn: integer("created_turn").notNull().default(0),
   updatedTurn: integer("updated_turn").notNull().default(0),
@@ -354,6 +357,51 @@ export const autoMoves = pgTable("auto_moves", {
 });
 
 export type AutoMove = typeof autoMoves.$inferSelect;
+
+export type BattlefieldStateDB = "open" | "locked" | "resolved";
+
+export const battlefields = pgTable("battlefields", {
+  id: serial("id").primaryKey(),
+  gameId: integer("game_id").references(() => gameRooms.id),
+  tileId: integer("tile_id").references(() => hexTiles.id),
+  state: text("state").notNull().$type<BattlefieldStateDB>().default("open"),
+  startedTurn: integer("started_turn").notNull(),
+  lastResolvedTurn: integer("last_resolved_turn").default(0),
+  createdAt: timestamp("created_at").defaultNow(),
+});
+
+export type Battlefield = typeof battlefields.$inferSelect;
+
+export type BattlefieldParticipantRoleDB = "attacker" | "defender" | "intervener";
+
+export const battlefieldParticipants = pgTable("battlefield_participants", {
+  id: serial("id").primaryKey(),
+  gameId: integer("game_id").references(() => gameRooms.id),
+  battlefieldId: integer("battlefield_id").references(() => battlefields.id),
+  playerId: integer("player_id").references(() => gamePlayers.id),
+  role: text("role").notNull().$type<BattlefieldParticipantRoleDB>(),
+  joinedTurn: integer("joined_turn").notNull(),
+  leftTurn: integer("left_turn"),
+  createdAt: timestamp("created_at").defaultNow(),
+});
+
+export type BattlefieldParticipant = typeof battlefieldParticipants.$inferSelect;
+
+export type BattlefieldActionTypeDB = "fight" | "retreat";
+
+export const battlefieldActions = pgTable("battlefield_actions", {
+  id: serial("id").primaryKey(),
+  gameId: integer("game_id").references(() => gameRooms.id),
+  battlefieldId: integer("battlefield_id").references(() => battlefields.id),
+  playerId: integer("player_id").references(() => gamePlayers.id),
+  turn: integer("turn").notNull(),
+  actionType: text("action_type").notNull().$type<BattlefieldActionTypeDB>(),
+  strategyText: text("strategy_text"),
+  resolved: boolean("resolved").default(false),
+  createdAt: timestamp("created_at").defaultNow(),
+});
+
+export type BattlefieldAction = typeof battlefieldActions.$inferSelect;
 
 export type EngagementStateDB = "engaged" | "attacker_retreating" | "defender_retreating" | "resolved";
 

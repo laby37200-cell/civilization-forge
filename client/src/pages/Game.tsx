@@ -151,6 +151,41 @@ export default function Game() {
     }
   }, [roomId]);
 
+  const [battlefieldsData, setBattlefieldsData] = useState<Array<{ battlefield: any; participants: number[]; myAction: { actionType: string; strategyText: string } | null }>>([]);
+  const loadBattlefields = useCallback(async () => {
+    if (!roomId) return;
+    try {
+      const res = await apiRequest("GET", `/api/rooms/${roomId}/battlefields`);
+      const json = (await res.json()) as { battlefields?: Array<{ battlefield: any; participants: number[]; myAction: { actionType: string; strategyText: string } | null }> };
+      setBattlefieldsData(Array.isArray(json?.battlefields) ? json.battlefields : []);
+    } catch (e) {
+      console.error("Failed to load battlefields:", e);
+    }
+  }, [roomId]);
+
+  const submitBattlefieldAction = useCallback(async (battlefieldId: number, actionType: "fight" | "retreat", strategyText?: string) => {
+    if (!roomId) return;
+    await apiRequest("POST", `/api/rooms/${roomId}/battlefields/${battlefieldId}/actions`, {
+      actionType,
+      strategyText: typeof strategyText === "string" ? strategyText : "",
+    });
+    await loadBattlefields();
+  }, [roomId, loadBattlefields]);
+
+  const [blockedAutoMove, setBlockedAutoMove] = useState<AutoMove | null>(null);
+  const [blockedAutoMoveOpen, setBlockedAutoMoveOpen] = useState(false);
+  const [dismissedBlockedAutoMoveId, setDismissedBlockedAutoMoveId] = useState<number | null>(null);
+  const [pendingAutoMoveAttackId, setPendingAutoMoveAttackId] = useState<number | null>(null);
+
+  const resolveBlockedAutoMove = useCallback(async (autoMoveId: number, choice: "attack" | "retreat" | "cancel", strategy?: string) => {
+    if (!roomId) return;
+    await apiRequest("POST", `/api/rooms/${roomId}/auto_moves/${autoMoveId}/resolve`, {
+      choice,
+      strategy: typeof strategy === "string" ? strategy : "",
+    });
+    await loadAutoMoves();
+  }, [roomId, loadAutoMoves]);
+
   const [autoMoveArmed, setAutoMoveArmed] = useState(false);
   const [autoMoveUnitType, setAutoMoveUnitType] = useState<UnitType>("infantry");
   const [autoMoveFromTileId, setAutoMoveFromTileId] = useState<number | null>(null);
@@ -247,6 +282,30 @@ export default function Game() {
     spy: 0,
   });
   const [attackStrategy, setAttackStrategy] = useState<string>("");
+
+  const [battlefieldDialogOpen, setBattlefieldDialogOpen] = useState(false);
+  const [activeBattlefield, setActiveBattlefield] = useState<{ battlefield: any; participants: number[]; myAction: { actionType: string; strategyText: string } | null } | null>(null);
+  const [battlefieldStrategyText, setBattlefieldStrategyText] = useState<string>("");
+  const [dismissedBattlefieldId, setDismissedBattlefieldId] = useState<number | null>(null);
+
+  useEffect(() => {
+    if (battlefieldDialogOpen) return;
+    const next = battlefieldsData.find((x) => x?.battlefield?.id != null && x.myAction == null) ?? null;
+    if (!next) return;
+    if (dismissedBattlefieldId != null && next.battlefield.id === dismissedBattlefieldId) return;
+    setActiveBattlefield(next);
+    setBattlefieldStrategyText("");
+    setBattlefieldDialogOpen(true);
+  }, [battlefieldsData, battlefieldDialogOpen, dismissedBattlefieldId]);
+
+  useEffect(() => {
+    if (blockedAutoMoveOpen) return;
+    const nextBlocked = autoMoves.find((m) => (m.status as any) === "blocked") ?? null;
+    if (!nextBlocked) return;
+    if (dismissedBlockedAutoMoveId != null && nextBlocked.id === dismissedBlockedAutoMoveId) return;
+    setBlockedAutoMove(nextBlocked);
+    setBlockedAutoMoveOpen(true);
+  }, [autoMoves, blockedAutoMoveOpen, dismissedBlockedAutoMoveId]);
 
   useEffect(() => {
     if (!roomId) {
@@ -522,16 +581,18 @@ export default function Game() {
     await loadPendingTradeCount();
     await loadIncomingAttacks();
     await loadAutoMoves();
-  }, [roomId, loadDiplomacy, loadPendingTradeCount, loadIncomingAttacks, loadAutoMoves]);
+    await loadBattlefields();
+  }, [roomId, loadDiplomacy, loadPendingTradeCount, loadIncomingAttacks, loadAutoMoves, loadBattlefields]);
 
   useEffect(() => {
     if (!roomId || !currentPlayer) return;
     const id = window.setInterval(() => {
       loadIncomingAttacks();
       loadAutoMoves();
+      loadBattlefields();
     }, 4000);
     return () => window.clearInterval(id);
-  }, [roomId, currentPlayer, loadIncomingAttacks, loadAutoMoves]);
+  }, [roomId, currentPlayer, loadIncomingAttacks, loadAutoMoves, loadBattlefields]);
 
   const getTroopsForTile = useCallback((tileId: number, ownerId: number | null): TroopData => {
     const base: TroopData = { infantry: 0, cavalry: 0, archer: 0, siege: 0, navy: 0, spy: 0 };
@@ -1144,9 +1205,10 @@ export default function Game() {
               <TabsContent value="city" className="h-full m-0 p-4">
                 {(() => {
                   const selectedCityCenterTileId = selectedCity?.centerTileId ?? null;
+                  const selectedCityCenterTileIdNum = selectedCityCenterTileId != null ? Number(selectedCityCenterTileId) : null;
                   const inc =
-                    selectedCityCenterTileId != null
-                      ? incomingAttacks.find((a) => a.targetTileId === selectedCityCenterTileId) ?? null
+                    selectedCityCenterTileIdNum != null && Number.isFinite(selectedCityCenterTileIdNum)
+                      ? incomingAttacks.find((a) => a.targetTileId === selectedCityCenterTileIdNum) ?? null
                       : null;
                   const attackerName =
                     inc?.attackerId != null
@@ -1412,6 +1474,29 @@ export default function Game() {
         isAttacker={battleIsAttacker}
         timeRemaining={timeRemaining}
         onSubmitStrategy={(strategy) => {
+          if (pendingAutoMoveAttackId != null) {
+            resolveBlockedAutoMove(pendingAutoMoveAttackId, "attack", strategy)
+              .then(() => {
+                toast({
+                  title: "공격 제출됨",
+                  description: "자동이동 중단 상황에서 공격이 제출되었습니다.",
+                });
+              })
+              .catch((e: any) => {
+                toast({
+                  title: "공격 제출 실패",
+                  description: e?.message || "오류가 발생했습니다.",
+                  variant: "destructive",
+                });
+              })
+              .finally(() => {
+                setPendingAutoMoveAttackId(null);
+                setBattleOpen(false);
+                setCurrentBattle(null);
+              });
+            return;
+          }
+
           if (!actionFromTileId || !actionTargetTileId) {
             setBattleOpen(false);
             return;
@@ -1426,6 +1511,224 @@ export default function Game() {
           setCurrentBattle(null);
         }}
       />
+
+      <Dialog
+        open={blockedAutoMoveOpen}
+        onOpenChange={(open) => {
+          if (!open) {
+            setBlockedAutoMoveOpen(false);
+            if (blockedAutoMove?.id != null) setDismissedBlockedAutoMoveId(blockedAutoMove.id);
+          }
+        }}
+      >
+        <DialogContent className="max-w-md">
+          <DialogHeader>
+            <DialogTitle>자동이동 중단</DialogTitle>
+            <DialogDescription>
+              자동이동이 장애물로 중단되었습니다. 행동을 선택하세요.
+            </DialogDescription>
+          </DialogHeader>
+
+          {blockedAutoMove ? (
+            <div className="space-y-2 text-sm">
+              <div className="text-muted-foreground">
+                #{blockedAutoMove.id} {String(blockedAutoMove.unitType)} {blockedAutoMove.amount ?? 100}
+              </div>
+              <div className="text-muted-foreground">
+                현재: {blockedAutoMove.currentTileId} / 막힘: {blockedAutoMove.blockedTileId}
+              </div>
+              {blockedAutoMove.blockedReason ? (
+                <div className="text-muted-foreground">사유: {String(blockedAutoMove.blockedReason)}</div>
+              ) : null}
+            </div>
+          ) : null}
+
+          <DialogFooter className="gap-2 sm:gap-2">
+            <Button
+              variant="destructive"
+              disabled={!blockedAutoMove?.id || !blockedAutoMove.currentTileId || !blockedAutoMove.blockedTileId}
+              onClick={() => {
+                if (!blockedAutoMove?.id) return;
+                if (!blockedAutoMove.currentTileId || !blockedAutoMove.blockedTileId) return;
+
+                const ut = String(blockedAutoMove.unitType) as UnitType;
+                const amount = blockedAutoMove.amount ?? 100;
+                const nextUnits: TroopData = { infantry: 0, cavalry: 0, archer: 0, siege: 0, navy: 0, spy: 0 };
+                if (ut in nextUnits) {
+                  (nextUnits as any)[ut] = amount;
+                }
+
+                setActionFromTileId(blockedAutoMove.currentTileId);
+                setActionTargetTileId(blockedAutoMove.blockedTileId);
+                setActionUnits(nextUnits);
+
+                const targetTile = tiles.find((t) => t.id === blockedAutoMove.blockedTileId);
+                const defenderId = targetTile?.ownerId ?? null;
+                const defenderTroops = defenderId ? getTroopsForTile(blockedAutoMove.blockedTileId, defenderId) : { infantry: 0, cavalry: 0, archer: 0, siege: 0, navy: 0, spy: 0 };
+                setCurrentBattle({
+                  id: `auto-move-${Date.now()}`,
+                  attackerId: String(currentPlayer?.id ?? ""),
+                  defenderId: String(defenderId ?? ""),
+                  attackerTroops: nextUnits,
+                  defenderTroops,
+                  terrain: targetTile?.terrain ?? "plains",
+                  cityId: targetTile?.cityId == null ? null : String(targetTile.cityId),
+                  result: null,
+                });
+                setBattleIsAttacker(true);
+                setPendingAutoMoveAttackId(blockedAutoMove.id);
+
+                setBlockedAutoMoveOpen(false);
+                setDismissedBlockedAutoMoveId(null);
+                setBattleOpen(true);
+              }}
+            >
+              공격
+            </Button>
+            <Button
+              variant="secondary"
+              disabled={!blockedAutoMove?.id}
+              onClick={() => {
+                if (!blockedAutoMove?.id) return;
+                resolveBlockedAutoMove(blockedAutoMove.id, "retreat")
+                  .then(() => {
+                    toast({ title: "후퇴", description: "자동이동을 중단하고 후퇴를 선택했습니다." });
+                  })
+                  .catch((e: any) => {
+                    toast({ title: "후퇴 실패", description: e?.message || "오류가 발생했습니다.", variant: "destructive" });
+                  })
+                  .finally(() => {
+                    setBlockedAutoMoveOpen(false);
+                    setDismissedBlockedAutoMoveId(null);
+                    setBlockedAutoMove(null);
+                  });
+              }}
+            >
+              후퇴
+            </Button>
+            <Button
+              variant="outline"
+              disabled={!blockedAutoMove?.id}
+              onClick={() => {
+                if (!blockedAutoMove?.id) return;
+                resolveBlockedAutoMove(blockedAutoMove.id, "cancel")
+                  .then(() => {
+                    toast({ title: "취소", description: "자동이동을 취소했습니다." });
+                  })
+                  .catch((e: any) => {
+                    toast({ title: "취소 실패", description: e?.message || "오류가 발생했습니다.", variant: "destructive" });
+                  })
+                  .finally(() => {
+                    setBlockedAutoMoveOpen(false);
+                    setDismissedBlockedAutoMoveId(null);
+                    setBlockedAutoMove(null);
+                  });
+              }}
+            >
+              취소
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      <Dialog
+        open={battlefieldDialogOpen}
+        onOpenChange={(open) => {
+          if (!open) {
+            setBattlefieldDialogOpen(false);
+            if (activeBattlefield?.battlefield?.id != null) setDismissedBattlefieldId(activeBattlefield.battlefield.id);
+          }
+        }}
+      >
+        <DialogContent className="max-w-lg">
+          <DialogHeader>
+            <DialogTitle>전장 행동 선택</DialogTitle>
+            <DialogDescription>
+              전장에 참여 중입니다. 이번 턴 행동을 선택하세요.
+            </DialogDescription>
+          </DialogHeader>
+
+          {activeBattlefield ? (
+            <div className="space-y-3">
+              <div className="text-sm text-muted-foreground">
+                전장 #{String(activeBattlefield.battlefield?.id ?? "-")} / 타일 {String(activeBattlefield.battlefield?.tileId ?? "-")}
+              </div>
+              <div className="text-sm">
+                참가자:
+                <div className="mt-1 text-muted-foreground">
+                  {(activeBattlefield.participants ?? []).map((pid) => {
+                    const p = players.find((x) => x.id === pid) ?? null;
+                    return (
+                      <div key={pid}>
+                        {p?.nationId ?? `Player ${pid}`}
+                      </div>
+                    );
+                  })}
+                </div>
+              </div>
+
+              <div className="space-y-1">
+                <div className="text-sm font-medium">전략(선택)</div>
+                <Textarea
+                  value={battlefieldStrategyText}
+                  onChange={(e) => setBattlefieldStrategyText(e.target.value)}
+                  placeholder="이번 턴 전장 전략을 입력하세요 (선택)"
+                  rows={4}
+                />
+              </div>
+            </div>
+          ) : null}
+
+          <DialogFooter className="gap-2 sm:gap-2">
+            <Button
+              variant="destructive"
+              disabled={!activeBattlefield?.battlefield?.id}
+              onClick={() => {
+                const bfId = activeBattlefield?.battlefield?.id;
+                if (!bfId) return;
+                submitBattlefieldAction(bfId, "fight", battlefieldStrategyText)
+                  .then(() => {
+                    toast({ title: "전투 선택", description: "전장 행동이 제출되었습니다." });
+                  })
+                  .catch((e: any) => {
+                    toast({ title: "제출 실패", description: e?.message || "오류가 발생했습니다.", variant: "destructive" });
+                  })
+                  .finally(() => {
+                    setBattlefieldDialogOpen(false);
+                    setDismissedBattlefieldId(null);
+                    setActiveBattlefield(null);
+                    setBattlefieldStrategyText("");
+                  });
+              }}
+            >
+              전투
+            </Button>
+            <Button
+              variant="secondary"
+              disabled={!activeBattlefield?.battlefield?.id}
+              onClick={() => {
+                const bfId = activeBattlefield?.battlefield?.id;
+                if (!bfId) return;
+                submitBattlefieldAction(bfId, "retreat")
+                  .then(() => {
+                    toast({ title: "후퇴", description: "전장에서 후퇴를 선택했습니다." });
+                  })
+                  .catch((e: any) => {
+                    toast({ title: "후퇴 실패", description: e?.message || "오류가 발생했습니다.", variant: "destructive" });
+                  })
+                  .finally(() => {
+                    setBattlefieldDialogOpen(false);
+                    setDismissedBattlefieldId(null);
+                    setActiveBattlefield(null);
+                    setBattlefieldStrategyText("");
+                  });
+              }}
+            >
+              후퇴
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
 
       <Dialog open={recruitOpen} onOpenChange={(open) => !open && setRecruitOpen(false)}>
         <DialogContent className="max-w-md">

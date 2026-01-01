@@ -18,6 +18,9 @@ import {
   spies,
   aiMemory,
   autoMoves,
+  battlefields,
+  battlefieldParticipants,
+  battlefieldActions,
   engagements,
   engagementActions,
   CityGradeStats,
@@ -38,6 +41,7 @@ import {
   type SpyLocationType,
   type NewsVisibilityDB,
   type EngagementActionTypeDB,
+  type BattlefieldActionTypeDB,
   users,
   chatMessages,
   type ChatChannelDB,
@@ -47,7 +51,7 @@ import {
 } from "@shared/schema";
 import { eq, and, sql, gt, lt, or, ne, inArray, isNotNull, isNull } from "drizzle-orm";
 import { generateNewsNarrative, judgeBattle } from "./llm";
-import { getNeighbors } from "./turnResolution";
+import { getNeighbors, computeAutoMovePath } from "./turnResolution";
 import { loadAppendixA_Cities } from "./gddLoader";
 import { createSpy, deploySpy, proposeTrade, respondTrade } from "./turnResolution";
 import { hash, compare } from "bcrypt";
@@ -847,6 +851,33 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
       return res.status(404).json({ error: "Player not found" });
     }
 
+    const friendlyIds = new Set<number>([me.id]);
+    if (me.nationId) {
+      const sameNation = await db
+        .select({ id: gamePlayers.id })
+        .from(gamePlayers)
+        .where(and(eq(gamePlayers.gameId, roomId), eq(gamePlayers.nationId, me.nationId)));
+      for (const r of sameNation) friendlyIds.add(r.id);
+    }
+    const allyRows = await db
+      .select({ p1: diplomacy.player1Id, p2: diplomacy.player2Id })
+      .from(diplomacy)
+      .where(and(eq(diplomacy.gameId, roomId), eq(diplomacy.status, "alliance" as any), or(eq(diplomacy.player1Id, me.id), eq(diplomacy.player2Id, me.id))));
+    for (const r of allyRows) {
+      const other = r.p1 === me.id ? r.p2 : r.p1;
+      if (other) friendlyIds.add(other);
+    }
+
+    const warIds = new Set<number>();
+    const warRows = await db
+      .select({ p1: diplomacy.player1Id, p2: diplomacy.player2Id })
+      .from(diplomacy)
+      .where(and(eq(diplomacy.gameId, roomId), eq(diplomacy.status, "war" as any), or(eq(diplomacy.player1Id, me.id), eq(diplomacy.player2Id, me.id))));
+    for (const r of warRows) {
+      const other = r.p1 === me.id ? r.p2 : r.p1;
+      if (other) warIds.add(other);
+    }
+
     const [fromTile] = await db.select().from(hexTiles).where(and(eq(hexTiles.gameId, roomId), eq(hexTiles.id, fromTileId)));
     const [toTile] = await db.select().from(hexTiles).where(and(eq(hexTiles.gameId, roomId), eq(hexTiles.id, targetTileId)));
     if (!fromTile || !toTile) {
@@ -881,69 +912,10 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
       return res.status(409).json({ error: "Not enough units" });
     }
 
-    const tiles = await db
-      .select({ id: hexTiles.id, q: hexTiles.q, r: hexTiles.r, ownerId: hexTiles.ownerId })
-      .from(hexTiles)
-      .where(eq(hexTiles.gameId, roomId));
-    const idByCoord = new Map<string, number>();
-    const ownerById = new Map<number, number | null>();
-    for (const t of tiles) {
-      idByCoord.set(`${t.q},${t.r}`, t.id);
-      ownerById.set(t.id, t.ownerId ?? null);
-    }
-    const dirs: Array<[number, number]> = [[1,0],[1,-1],[0,-1],[-1,0],[-1,1],[0,1]];
-    const coordById = new Map<number, { q: number; r: number }>(tiles.map((t) => [t.id, { q: t.q, r: t.r }]));
-    const neigh = (id: number) => {
-      const c = coordById.get(id);
-      if (!c) return [] as number[];
-      const out: number[] = [];
-      for (const [dq, dr] of dirs) {
-        const nid = idByCoord.get(`${c.q + dq},${c.r + dr}`);
-        if (nid != null) out.push(nid);
-      }
-      return out;
-    };
-
-    const occRows = await db
-      .select({ tileId: units.tileId, ownerId: units.ownerId })
-      .from(units)
-      .where(and(eq(units.gameId, roomId), isNotNull(units.tileId), isNotNull(units.ownerId), ne(units.ownerId, me.id)));
-    const enemyUnitTiles = new Set<number>();
-    for (const r of occRows) {
-      const tid = r.tileId;
-      const oid = r.ownerId;
-      if (!tid || !oid) continue;
-      if (!friendlyIds.has(oid)) {
-        enemyUnitTiles.add(tid);
-      }
-    }
-
-    const prev = new Map<number, number | null>();
-    const q: number[] = [fromTileId];
-    prev.set(fromTileId, null);
-    while (q.length) {
-      const cur = q.shift()!;
-      if (cur === targetTileId) break;
-      for (const n of neigh(cur)) {
-        if (prev.has(n)) continue;
-        const o = ownerById.get(n);
-        if (enemyUnitTiles.has(n) && n !== targetTileId) continue;
-        if (o != null && !friendlyIds.has(o) && !warIds.has(o)) continue;
-        prev.set(n, cur);
-        q.push(n);
-      }
-    }
-    if (!prev.has(targetTileId)) {
+    const path = await computeAutoMovePath(roomId, me.id, fromTileId, targetTileId, unitType as any, amount);
+    if (!path || path.length < 2) {
       return res.status(409).json({ error: "No path" });
     }
-
-    const path: number[] = [];
-    let cur: number | null = targetTileId;
-    while (cur != null) {
-      path.push(cur);
-      cur = prev.get(cur) ?? null;
-    }
-    path.reverse();
 
     const [room] = await db
       .select({ turn: gameRooms.currentTurn })
@@ -1006,6 +978,232 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
       return res.status(404).json({ error: "Auto move not found" });
     }
     res.json({ success: true });
+  });
+
+  app.post("/api/rooms/:id/auto_moves/:autoMoveId/resolve", async (req, res) => {
+    const oderId = (req.session as any)?.oderId;
+    if (!oderId) {
+      return res.status(401).json({ error: "Not authenticated" });
+    }
+    const roomId = parseInt(req.params.id);
+    const autoMoveId = Number(req.params.autoMoveId);
+    if (!Number.isFinite(autoMoveId)) {
+      return res.status(400).json({ error: "Invalid id" });
+    }
+
+    const choice = String(req.body?.choice ?? "").trim();
+    if (choice !== "attack" && choice !== "retreat" && choice !== "cancel") {
+      return res.status(400).json({ error: "Invalid choice" });
+    }
+
+    const strategy = typeof req.body?.strategy === "string" ? req.body.strategy : "";
+
+    const [me] = await db
+      .select({ id: gamePlayers.id })
+      .from(gamePlayers)
+      .where(and(eq(gamePlayers.gameId, roomId), eq(gamePlayers.oderId, oderId)));
+    if (!me) {
+      return res.status(404).json({ error: "Player not found" });
+    }
+
+    const [room] = await db
+      .select({ turn: gameRooms.currentTurn })
+      .from(gameRooms)
+      .where(eq(gameRooms.id, roomId));
+    const turn = room?.turn ?? 1;
+
+    const [m] = await db
+      .select()
+      .from(autoMoves)
+      .where(and(eq(autoMoves.id, autoMoveId), eq(autoMoves.gameId, roomId), eq(autoMoves.playerId, me.id)));
+    if (!m) {
+      return res.status(404).json({ error: "Auto move not found" });
+    }
+    if ((m.status as any) !== "blocked") {
+      return res.status(409).json({ error: "Auto move is not blocked" });
+    }
+    if (!m.currentTileId || !m.blockedTileId) {
+      return res.status(409).json({ error: "Auto move missing blocked info" });
+    }
+
+    if (choice === "attack") {
+      await db.insert(turnActions).values({
+        gameId: roomId,
+        playerId: me.id,
+        turn,
+        actionType: "attack" as any,
+        data: {
+          fromTileId: m.currentTileId,
+          targetTileId: m.blockedTileId,
+          units: { [String(m.unitType)]: m.amount ?? 100 },
+          strategy,
+        },
+        resolved: false,
+      });
+
+      await db
+        .update(autoMoves)
+        .set({ status: "canceled", cancelReason: "blocked_attack_submitted", updatedTurn: turn })
+        .where(and(eq(autoMoves.id, autoMoveId), eq(autoMoves.gameId, roomId), eq(autoMoves.playerId, me.id)));
+
+      return res.json({ success: true, submitted: "attack" });
+    }
+
+    await db
+      .update(autoMoves)
+      .set({ status: "canceled", cancelReason: choice === "retreat" ? "blocked_retreat" : "blocked_canceled", updatedTurn: turn })
+      .where(and(eq(autoMoves.id, autoMoveId), eq(autoMoves.gameId, roomId), eq(autoMoves.playerId, me.id)));
+
+    res.json({ success: true, submitted: choice });
+  });
+
+  app.get("/api/rooms/:id/battlefields", async (req, res) => {
+    const oderId = (req.session as any)?.oderId;
+    if (!oderId) {
+      return res.status(401).json({ error: "Not authenticated" });
+    }
+
+    const roomId = parseInt(req.params.id);
+    const [me] = await db
+      .select({ id: gamePlayers.id })
+      .from(gamePlayers)
+      .where(and(eq(gamePlayers.gameId, roomId), eq(gamePlayers.oderId, oderId)));
+    if (!me) {
+      return res.status(404).json({ error: "Player not found" });
+    }
+
+    const [room] = await db
+      .select({ turn: gameRooms.currentTurn })
+      .from(gameRooms)
+      .where(eq(gameRooms.id, roomId));
+    const turn = room?.turn ?? 1;
+
+    const bfIdsRows = await db
+      .select({ battlefieldId: battlefieldParticipants.battlefieldId })
+      .from(battlefieldParticipants)
+      .where(and(eq(battlefieldParticipants.gameId, roomId), eq(battlefieldParticipants.playerId, me.id), isNull(battlefieldParticipants.leftTurn)));
+    const bfIds = Array.from(new Set<number>(bfIdsRows.map((r) => r.battlefieldId!).filter((x): x is number => typeof x === "number")));
+    if (bfIds.length === 0) {
+      return res.json({ turn, battlefields: [] });
+    }
+
+    const bfs = await db
+      .select()
+      .from(battlefields)
+      .where(and(eq(battlefields.gameId, roomId), inArray(battlefields.id, bfIds), ne(battlefields.state, "resolved" as any)));
+
+    const parts = await db
+      .select({ battlefieldId: battlefieldParticipants.battlefieldId, playerId: battlefieldParticipants.playerId })
+      .from(battlefieldParticipants)
+      .where(and(eq(battlefieldParticipants.gameId, roomId), inArray(battlefieldParticipants.battlefieldId, bfIds), isNull(battlefieldParticipants.leftTurn)));
+    const participantsByBf = new Map<number, number[]>();
+    for (const p of parts) {
+      const bid = p.battlefieldId;
+      const pid = p.playerId;
+      if (!bid || !pid) continue;
+      const arr = participantsByBf.get(bid) ?? [];
+      arr.push(pid);
+      participantsByBf.set(bid, arr);
+    }
+
+    const myActions = await db
+      .select({ battlefieldId: battlefieldActions.battlefieldId, actionType: battlefieldActions.actionType, strategyText: battlefieldActions.strategyText })
+      .from(battlefieldActions)
+      .where(and(eq(battlefieldActions.gameId, roomId), inArray(battlefieldActions.battlefieldId, bfIds), eq(battlefieldActions.turn, turn), eq(battlefieldActions.playerId, me.id), eq(battlefieldActions.resolved, false)));
+    const myActionByBf = new Map<number, { actionType: string; strategyText: string }>();
+    for (const a of myActions) {
+      const bid = a.battlefieldId;
+      if (!bid) continue;
+      myActionByBf.set(bid, { actionType: String(a.actionType), strategyText: typeof a.strategyText === "string" ? a.strategyText : "" });
+    }
+
+    res.json({
+      turn,
+      battlefields: bfs.map((bf) => ({
+        battlefield: bf,
+        participants: participantsByBf.get(bf.id) ?? [],
+        myAction: myActionByBf.get(bf.id) ?? null,
+      })),
+    });
+  });
+
+  app.post("/api/rooms/:id/battlefields/:battlefieldId/actions", async (req, res) => {
+    const oderId = (req.session as any)?.oderId;
+    if (!oderId) {
+      return res.status(401).json({ error: "Not authenticated" });
+    }
+
+    const roomId = parseInt(req.params.id);
+    const battlefieldId = Number(req.params.battlefieldId);
+    if (!Number.isFinite(battlefieldId)) {
+      return res.status(400).json({ error: "Invalid battlefieldId" });
+    }
+
+    const actionType = String(req.body?.actionType ?? "").trim() as BattlefieldActionTypeDB;
+    if (actionType !== "fight" && actionType !== "retreat") {
+      return res.status(400).json({ error: "Invalid actionType" });
+    }
+
+    const strategyText = typeof req.body?.strategyText === "string" ? req.body.strategyText : "";
+
+    const [me] = await db
+      .select({ id: gamePlayers.id })
+      .from(gamePlayers)
+      .where(and(eq(gamePlayers.gameId, roomId), eq(gamePlayers.oderId, oderId)));
+    if (!me) {
+      return res.status(404).json({ error: "Player not found" });
+    }
+
+    const [room] = await db
+      .select({ turn: gameRooms.currentTurn })
+      .from(gameRooms)
+      .where(eq(gameRooms.id, roomId));
+    const turn = room?.turn ?? 1;
+
+    const [bf] = await db
+      .select()
+      .from(battlefields)
+      .where(and(eq(battlefields.gameId, roomId), eq(battlefields.id, battlefieldId)));
+    if (!bf) {
+      return res.status(404).json({ error: "Battlefield not found" });
+    }
+    if ((bf.state as any) === "resolved") {
+      return res.status(409).json({ error: "Battlefield already resolved" });
+    }
+
+    const [participant] = await db
+      .select({ id: battlefieldParticipants.id })
+      .from(battlefieldParticipants)
+      .where(and(eq(battlefieldParticipants.gameId, roomId), eq(battlefieldParticipants.battlefieldId, battlefieldId), eq(battlefieldParticipants.playerId, me.id), isNull(battlefieldParticipants.leftTurn)));
+    if (!participant) {
+      return res.status(403).json({ error: "Not a participant" });
+    }
+
+    const [existing] = await db
+      .select({ id: battlefieldActions.id })
+      .from(battlefieldActions)
+      .where(and(eq(battlefieldActions.gameId, roomId), eq(battlefieldActions.battlefieldId, battlefieldId), eq(battlefieldActions.playerId, me.id), eq(battlefieldActions.turn, turn), eq(battlefieldActions.resolved, false)))
+      .limit(1);
+
+    if (existing?.id) {
+      await db
+        .update(battlefieldActions)
+        .set({ actionType: actionType as any, strategyText })
+        .where(eq(battlefieldActions.id, existing.id));
+      return res.json({ success: true, updated: true });
+    }
+
+    await db.insert(battlefieldActions).values({
+      gameId: roomId,
+      battlefieldId,
+      playerId: me.id,
+      turn,
+      actionType: actionType as any,
+      strategyText,
+      resolved: false,
+    });
+
+    res.json({ success: true, created: true });
   });
 
   app.get("/api/rooms/:id/engagements", async (req, res) => {
