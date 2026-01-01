@@ -17,9 +17,13 @@ import {
   trades,
   spies,
   aiMemory,
+  autoMoves,
+  engagements,
+  engagementActions,
   CityGradeStats,
   UnitStats,
   BuildingStats,
+  type CityGrade,
   type TurnAction,
   type UnitTypeDB,
   type BuildingType,
@@ -33,6 +37,7 @@ import {
   type SpyMission,
   type SpyLocationType,
   type NewsVisibilityDB,
+  type EngagementActionTypeDB,
   users,
   chatMessages,
   type ChatChannelDB,
@@ -40,7 +45,7 @@ import {
   NationsInitialData,
   type AIDifficulty
 } from "@shared/schema";
-import { eq, and, sql, gt, lt, or, ne, inArray, isNotNull } from "drizzle-orm";
+import { eq, and, sql, gt, lt, or, ne, inArray, isNotNull, isNull } from "drizzle-orm";
 import { generateNewsNarrative, judgeBattle } from "./llm";
 import { getNeighbors } from "./turnResolution";
 import { loadAppendixA_Cities } from "./gddLoader";
@@ -84,6 +89,53 @@ async function shareAllianceVision(gameId: number, player1Id: number, player2Id:
     }
   }
 }
+
+async function claimAISlot(roomId: number, oderId: number) {
+  const [existing] = await db
+    .select()
+    .from(gamePlayers)
+    .where(and(eq(gamePlayers.gameId, roomId), eq(gamePlayers.oderId, oderId)));
+
+  if (existing) {
+    await db
+      .update(gamePlayers)
+      .set({ lastSeenAt: new Date(), isAbandoned: false, abandonedAt: null })
+      .where(eq(gamePlayers.id, existing.id));
+    return existing;
+  }
+
+  const [slot] = await db
+    .select()
+    .from(gamePlayers)
+    .where(
+      and(
+        eq(gamePlayers.gameId, roomId),
+        eq(gamePlayers.isAI, true),
+        isNull(gamePlayers.oderId),
+        eq(gamePlayers.isEliminated, false)
+      )
+    )
+    .orderBy(gamePlayers.id)
+    .limit(1);
+
+  if (!slot) return null;
+
+  const [updated] = await db
+    .update(gamePlayers)
+    .set({
+      oderId,
+      isAI: false,
+      aiDifficulty: null,
+      lastSeenAt: new Date(),
+      isAbandoned: false,
+      abandonedAt: null,
+    })
+    .where(eq(gamePlayers.id, slot.id))
+    .returning();
+
+  return updated ?? null;
+}
+
 export async function registerRoutes(httpServer: Server, app: Express): Promise<Server> {
   
   // === AUTH ROUTES ===
@@ -163,7 +215,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
         name: gameRooms.name,
         hostId: gameRooms.hostId,
         hostName: users.username,
-        playerCount: sql<number>`count(${gamePlayers.id})`.mapWith(Number),
+        playerCount: sql<number>`count(${gamePlayers.oderId})`.mapWith(Number),
         maxPlayers: gameRooms.maxPlayers,
         turnDuration: gameRooms.turnDuration,
         phase: gameRooms.phase,
@@ -211,12 +263,10 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
 
       await seedRoom(room.id);
 
-      // 호스트를 자동으로 플레이어로 추가
-      const [hostPlayer] = await db.insert(gamePlayers).values({
-        gameId: room.id,
-        oderId: oderId,
-        color: "#3b82f6",
-      }).returning();
+      const hostPlayer = await claimAISlot(room.id, oderId);
+      if (!hostPlayer) {
+        return res.status(409).json({ error: "Room is full" });
+      }
 
       res.json({ ...room, playerId: hostPlayer.id });
     } catch (error) {
@@ -229,6 +279,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
         await db.delete(news).where(eq(news.gameId, rid));
         await db.delete(chatMessages).where(eq(chatMessages.gameId, rid));
         await db.delete(aiMemory).where(eq(aiMemory.gameId, rid));
+        await db.delete(autoMoves).where(eq(autoMoves.gameId, rid));
         await db.delete(trades).where(eq(trades.gameId, rid));
         await db.delete(diplomacy).where(eq(diplomacy.gameId, rid));
         await db.delete(spies).where(eq(spies.gameId, rid));
@@ -266,6 +317,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
     await db.delete(news).where(eq(news.gameId, roomId));
     await db.delete(chatMessages).where(eq(chatMessages.gameId, roomId));
     await db.delete(aiMemory).where(eq(aiMemory.gameId, roomId));
+    await db.delete(autoMoves).where(eq(autoMoves.gameId, roomId));
     await db.delete(trades).where(eq(trades.gameId, roomId));
     await db.delete(diplomacy).where(eq(diplomacy.gameId, roomId));
     await db.delete(spies).where(eq(spies.gameId, roomId));
@@ -464,28 +516,10 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
     
     try {
       await seedRoom(roomId);
-      const [existing] = await db
-        .select()
-        .from(gamePlayers)
-        .where(and(eq(gamePlayers.gameId, roomId), eq(gamePlayers.oderId, oderId)));
-
-      if (existing) {
-        await db
-          .update(gamePlayers)
-          .set({ lastSeenAt: new Date(), isAbandoned: false, abandonedAt: null })
-          .where(eq(gamePlayers.id, existing.id));
-        return res.json(existing);
+      const player = await claimAISlot(roomId, oderId);
+      if (!player) {
+        return res.status(409).json({ error: "Room is full" });
       }
-
-      const [player] = await db
-        .insert(gamePlayers)
-        .values({
-          gameId: roomId,
-          oderId: oderId,
-          color: req.body.color || "#3b82f6",
-        })
-        .returning();
-
       res.json(player);
     } catch (error) {
       res.status(500).json({ error: "Failed to join room" });
@@ -515,6 +549,11 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
 
     if (!player) {
       return res.status(404).json({ error: "Player not found" });
+    }
+
+    // 좌석(도시/국가) 기반으로 시작하므로, 이미 nationId가 있으면 변경을 막는다.
+    if (player.nationId && player.nationId !== nationId) {
+      return res.status(409).json({ error: "Nation is already assigned for this seat" });
     }
 
     const [updated] = await db
@@ -561,6 +600,9 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
     }
 
     if (city.ownerId) {
+      if (city.ownerId === player.id) {
+        return res.json(city);
+      }
       return res.status(409).json({ error: "City already owned" });
     }
 
@@ -579,7 +621,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
       .set({ ownerId: player.id })
       .where(and(eq(hexTiles.gameId, roomId), eq(hexTiles.cityId, city.id)));
 
-    const stats = CityGradeStats[city.grade];
+    const stats = CityGradeStats[city.grade as CityGrade];
     if (city.centerTileId) {
       await db.insert(units).values({
         gameId: roomId,
@@ -638,6 +680,451 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
     }
 
     res.json(updatedCity);
+  });
+
+  app.get("/api/rooms/:id/incoming_attacks", async (req, res) => {
+    const oderId = (req.session as any)?.oderId;
+    if (!oderId) {
+      return res.status(401).json({ error: "Not authenticated" });
+    }
+
+    const roomId = parseInt(req.params.id);
+    const [me] = await db
+      .select()
+      .from(gamePlayers)
+      .where(and(eq(gamePlayers.gameId, roomId), eq(gamePlayers.oderId, oderId)));
+    if (!me) {
+      return res.status(404).json({ error: "Player not found" });
+    }
+
+    const friendlyIds = new Set<number>([me.id]);
+    if (me.nationId) {
+      const sameNation = await db
+        .select({ id: gamePlayers.id })
+        .from(gamePlayers)
+        .where(and(eq(gamePlayers.gameId, roomId), eq(gamePlayers.nationId, me.nationId)));
+      for (const r of sameNation) friendlyIds.add(r.id);
+    }
+    const allyRows = await db
+      .select({ p1: diplomacy.player1Id, p2: diplomacy.player2Id })
+      .from(diplomacy)
+      .where(and(eq(diplomacy.gameId, roomId), eq(diplomacy.status, "alliance" as any), or(eq(diplomacy.player1Id, me.id), eq(diplomacy.player2Id, me.id))));
+    for (const r of allyRows) {
+      const other = r.p1 === me.id ? r.p2 : r.p1;
+      if (other) friendlyIds.add(other);
+    }
+
+    const warIds = new Set<number>();
+    const warRows = await db
+      .select({ p1: diplomacy.player1Id, p2: diplomacy.player2Id })
+      .from(diplomacy)
+      .where(and(eq(diplomacy.gameId, roomId), eq(diplomacy.status, "war" as any), or(eq(diplomacy.player1Id, me.id), eq(diplomacy.player2Id, me.id))));
+    for (const r of warRows) {
+      const other = r.p1 === me.id ? r.p2 : r.p1;
+      if (other) warIds.add(other);
+    }
+
+    const [room] = await db
+      .select({ turn: gameRooms.currentTurn })
+      .from(gameRooms)
+      .where(eq(gameRooms.id, roomId));
+    const turn = room?.turn ?? 1;
+
+    const actions = await db
+      .select({ id: turnActions.id, playerId: turnActions.playerId, data: turnActions.data })
+      .from(turnActions)
+      .where(and(eq(turnActions.gameId, roomId), eq(turnActions.turn, turn), eq(turnActions.actionType, "attack" as any), eq(turnActions.resolved, false)));
+
+    const targetIds: number[] = [];
+    for (const a of actions) {
+      const d = (a.data ?? {}) as any;
+      if (typeof d.targetTileId === "number") targetIds.push(d.targetTileId);
+    }
+
+    const targetTiles = targetIds.length
+      ? await db
+          .select({ id: hexTiles.id, ownerId: hexTiles.ownerId })
+          .from(hexTiles)
+          .where(and(eq(hexTiles.gameId, roomId), inArray(hexTiles.id, targetIds)))
+      : [];
+    const ownerByTargetId = new Map<number, number | null>(targetTiles.map((t) => [t.id, t.ownerId ?? null]));
+
+    const peekThreshold = 70;
+
+    const canPeek = async (attackerId: number): Promise<boolean> => {
+      const myEsp = me.espionagePower ?? 50;
+      if (myEsp < peekThreshold) return false;
+      const minTurns = 5;
+
+      const spiesOnCities = await db
+        .select({ createdTurn: spies.createdTurn, deployedTurn: spies.deployedTurn, mission: spies.mission, cityOwnerId: cities.ownerId })
+        .from(spies)
+        .leftJoin(cities, and(eq(spies.locationType, "city" as any), eq(spies.locationId, cities.id)))
+        .where(and(eq(spies.gameId, roomId), eq(spies.playerId, me.id), eq(spies.isAlive, true), ne(spies.mission, "idle" as any)));
+
+      for (const s of spiesOnCities) {
+        const since = (s.deployedTurn ?? s.createdTurn) ?? null;
+        if (!since) continue;
+        if ((turn - since) < minTurns) continue;
+        if (s.cityOwnerId === attackerId) return true;
+      }
+      return false;
+    };
+
+    const mask = (strategy: string) => {
+      const trimmed = String(strategy ?? "").trim();
+      if (!trimmed) return "";
+      const head = trimmed.slice(0, 12);
+      return `${head}...`;
+    };
+
+    const out: any[] = [];
+    for (const a of actions) {
+      const d = (a.data ?? {}) as any;
+      const targetTileId = Number(d.targetTileId);
+      if (!Number.isFinite(targetTileId)) continue;
+      if (ownerByTargetId.get(targetTileId) !== me.id) continue;
+      const attackerId = a.playerId;
+      if (!attackerId) continue;
+      const strategy = typeof d.strategy === "string" ? d.strategy : "";
+      const show = await canPeek(attackerId);
+
+      out.push({
+        id: a.id,
+        attackerId,
+        fromTileId: typeof d.fromTileId === "number" ? d.fromTileId : null,
+        targetTileId,
+        units: d.units ?? null,
+        strategyHint: show ? mask(strategy) : null,
+      });
+    }
+
+    res.json({ turn, incoming: out });
+  });
+
+  app.get("/api/rooms/:id/auto_moves", async (req, res) => {
+    const oderId = (req.session as any)?.oderId;
+    if (!oderId) {
+      return res.status(401).json({ error: "Not authenticated" });
+    }
+    const roomId = parseInt(req.params.id);
+    const [me] = await db
+      .select({ id: gamePlayers.id })
+      .from(gamePlayers)
+      .where(and(eq(gamePlayers.gameId, roomId), eq(gamePlayers.oderId, oderId)));
+    if (!me) {
+      return res.status(404).json({ error: "Player not found" });
+    }
+
+    const rows = await db
+      .select()
+      .from(autoMoves)
+      .where(and(eq(autoMoves.gameId, roomId), eq(autoMoves.playerId, me.id)));
+    res.json(rows);
+  });
+
+  app.post("/api/rooms/:id/auto_moves", async (req, res) => {
+    const oderId = (req.session as any)?.oderId;
+    if (!oderId) {
+      return res.status(401).json({ error: "Not authenticated" });
+    }
+
+    const roomId = parseInt(req.params.id);
+    const fromTileId = Number(req.body?.fromTileId);
+    const targetTileId = Number(req.body?.targetTileId);
+    const unitType = String(req.body?.unitType ?? "").trim() as any;
+    const amount = 100;
+
+    if (!Number.isFinite(fromTileId) || !Number.isFinite(targetTileId)) {
+      return res.status(400).json({ error: "Invalid tileId" });
+    }
+
+    const [me] = await db
+      .select()
+      .from(gamePlayers)
+      .where(and(eq(gamePlayers.gameId, roomId), eq(gamePlayers.oderId, oderId)));
+    if (!me) {
+      return res.status(404).json({ error: "Player not found" });
+    }
+
+    const [fromTile] = await db.select().from(hexTiles).where(and(eq(hexTiles.gameId, roomId), eq(hexTiles.id, fromTileId)));
+    const [toTile] = await db.select().from(hexTiles).where(and(eq(hexTiles.gameId, roomId), eq(hexTiles.id, targetTileId)));
+    if (!fromTile || !toTile) {
+      return res.status(404).json({ error: "Tile not found" });
+    }
+    if (toTile.ownerId && !friendlyIds.has(toTile.ownerId) && !warIds.has(toTile.ownerId)) {
+      return res.status(409).json({ error: "Target tile is not reachable" });
+    }
+
+    // 타겟 타일에 적 유닛이 있으면 자동이동 불가
+    const targetOccupiers = await db
+      .select({ ownerId: units.ownerId })
+      .from(units)
+      .where(and(eq(units.gameId, roomId), eq(units.tileId, targetTileId), isNotNull(units.ownerId), ne(units.ownerId, me.id)));
+    for (const o of targetOccupiers) {
+      const oid = o.ownerId;
+      if (!oid) continue;
+      if (!friendlyIds.has(oid)) {
+        return res.status(409).json({ error: "Target tile is occupied by enemy units" });
+      }
+    }
+
+    const unitRows = await db
+      .select({ tileId: units.tileId, unitType: units.unitType, count: units.count })
+      .from(units)
+      .where(and(eq(units.gameId, roomId), eq(units.ownerId, me.id), eq(units.tileId, fromTileId)));
+    const availableByType = new Map<string, number>();
+    for (const u of unitRows) {
+      availableByType.set(String(u.unitType), (availableByType.get(String(u.unitType)) ?? 0) + (u.count ?? 0));
+    }
+    if ((availableByType.get(String(unitType)) ?? 0) < amount) {
+      return res.status(409).json({ error: "Not enough units" });
+    }
+
+    const tiles = await db
+      .select({ id: hexTiles.id, q: hexTiles.q, r: hexTiles.r, ownerId: hexTiles.ownerId })
+      .from(hexTiles)
+      .where(eq(hexTiles.gameId, roomId));
+    const idByCoord = new Map<string, number>();
+    const ownerById = new Map<number, number | null>();
+    for (const t of tiles) {
+      idByCoord.set(`${t.q},${t.r}`, t.id);
+      ownerById.set(t.id, t.ownerId ?? null);
+    }
+    const dirs: Array<[number, number]> = [[1,0],[1,-1],[0,-1],[-1,0],[-1,1],[0,1]];
+    const coordById = new Map<number, { q: number; r: number }>(tiles.map((t) => [t.id, { q: t.q, r: t.r }]));
+    const neigh = (id: number) => {
+      const c = coordById.get(id);
+      if (!c) return [] as number[];
+      const out: number[] = [];
+      for (const [dq, dr] of dirs) {
+        const nid = idByCoord.get(`${c.q + dq},${c.r + dr}`);
+        if (nid != null) out.push(nid);
+      }
+      return out;
+    };
+
+    const occRows = await db
+      .select({ tileId: units.tileId, ownerId: units.ownerId })
+      .from(units)
+      .where(and(eq(units.gameId, roomId), isNotNull(units.tileId), isNotNull(units.ownerId), ne(units.ownerId, me.id)));
+    const enemyUnitTiles = new Set<number>();
+    for (const r of occRows) {
+      const tid = r.tileId;
+      const oid = r.ownerId;
+      if (!tid || !oid) continue;
+      if (!friendlyIds.has(oid)) {
+        enemyUnitTiles.add(tid);
+      }
+    }
+
+    const prev = new Map<number, number | null>();
+    const q: number[] = [fromTileId];
+    prev.set(fromTileId, null);
+    while (q.length) {
+      const cur = q.shift()!;
+      if (cur === targetTileId) break;
+      for (const n of neigh(cur)) {
+        if (prev.has(n)) continue;
+        const o = ownerById.get(n);
+        if (enemyUnitTiles.has(n) && n !== targetTileId) continue;
+        if (o != null && !friendlyIds.has(o) && !warIds.has(o)) continue;
+        prev.set(n, cur);
+        q.push(n);
+      }
+    }
+    if (!prev.has(targetTileId)) {
+      return res.status(409).json({ error: "No path" });
+    }
+
+    const path: number[] = [];
+    let cur: number | null = targetTileId;
+    while (cur != null) {
+      path.push(cur);
+      cur = prev.get(cur) ?? null;
+    }
+    path.reverse();
+
+    const [room] = await db
+      .select({ turn: gameRooms.currentTurn })
+      .from(gameRooms)
+      .where(eq(gameRooms.id, roomId));
+    const turn = room?.turn ?? 1;
+
+    const [row] = await db
+      .insert(autoMoves)
+      .values({
+        gameId: roomId,
+        playerId: me.id,
+        unitType,
+        amount,
+        currentTileId: fromTileId,
+        targetTileId,
+        path,
+        pathIndex: 0,
+        status: "active",
+        createdTurn: turn,
+        updatedTurn: turn,
+      })
+      .returning();
+
+    res.json(row);
+  });
+
+  app.delete("/api/rooms/:id/auto_moves/:autoMoveId", async (req, res) => {
+    const oderId = (req.session as any)?.oderId;
+    if (!oderId) {
+      return res.status(401).json({ error: "Not authenticated" });
+    }
+    const roomId = parseInt(req.params.id);
+    const autoMoveId = Number(req.params.autoMoveId);
+    if (!Number.isFinite(autoMoveId)) {
+      return res.status(400).json({ error: "Invalid id" });
+    }
+
+    const [me] = await db
+      .select({ id: gamePlayers.id })
+      .from(gamePlayers)
+      .where(and(eq(gamePlayers.gameId, roomId), eq(gamePlayers.oderId, oderId)));
+    if (!me) {
+      return res.status(404).json({ error: "Player not found" });
+    }
+
+    const [room] = await db
+      .select({ turn: gameRooms.currentTurn })
+      .from(gameRooms)
+      .where(eq(gameRooms.id, roomId));
+    const turn = room?.turn ?? 1;
+
+    const [updated] = await db
+      .update(autoMoves)
+      .set({ status: "canceled", cancelReason: "canceled_by_player", updatedTurn: turn })
+      .where(and(eq(autoMoves.id, autoMoveId), eq(autoMoves.gameId, roomId), eq(autoMoves.playerId, me.id)))
+      .returning();
+
+    if (!updated) {
+      return res.status(404).json({ error: "Auto move not found" });
+    }
+    res.json({ success: true });
+  });
+
+  app.get("/api/rooms/:id/engagements", async (req, res) => {
+    const oderId = (req.session as any)?.oderId;
+    if (!oderId) {
+      return res.status(401).json({ error: "Not authenticated" });
+    }
+
+    const roomId = parseInt(req.params.id);
+    const [me] = await db
+      .select({ id: gamePlayers.id })
+      .from(gamePlayers)
+      .where(and(eq(gamePlayers.gameId, roomId), eq(gamePlayers.oderId, oderId)));
+    if (!me) {
+      return res.status(404).json({ error: "Player not found" });
+    }
+
+    const rows = await db
+      .select()
+      .from(engagements)
+      .where(and(eq(engagements.gameId, roomId), ne(engagements.state, "resolved" as any)));
+
+    const tileIds = Array.from(new Set<number>(rows.map((r) => r.tileId!).filter((x): x is number => typeof x === "number")));
+    const unitRows = tileIds.length
+      ? await db
+          .select({ tileId: units.tileId, ownerId: units.ownerId, unitType: units.unitType, count: units.count })
+          .from(units)
+          .where(and(eq(units.gameId, roomId), inArray(units.tileId, tileIds)))
+      : [];
+
+    const byTileOwner = new Map<string, Record<string, number>>();
+    for (const u of unitRows) {
+      const tid = u.tileId;
+      const oid = u.ownerId;
+      if (!tid || !oid) continue;
+      const key = `${tid}:${oid}`;
+      const cur = byTileOwner.get(key) ?? {};
+      cur[String(u.unitType)] = (cur[String(u.unitType)] ?? 0) + (u.count ?? 0);
+      byTileOwner.set(key, cur);
+    }
+
+    const out = rows.map((e) => {
+      const atk = e.attackerId ? byTileOwner.get(`${e.tileId}:${e.attackerId}`) ?? {} : {};
+      const def = e.defenderId ? byTileOwner.get(`${e.tileId}:${e.defenderId}`) ?? {} : {};
+      return {
+        ...e,
+        attackerTroops: atk,
+        defenderTroops: def,
+      };
+    });
+
+    res.json(out);
+  });
+
+  app.post("/api/rooms/:id/engagements/:engagementId/actions", async (req, res) => {
+    const oderId = (req.session as any)?.oderId;
+    if (!oderId) {
+      return res.status(401).json({ error: "Not authenticated" });
+    }
+
+    const roomId = parseInt(req.params.id);
+    const engagementId = Number(req.params.engagementId);
+    if (!Number.isFinite(engagementId)) {
+      return res.status(400).json({ error: "Invalid engagementId" });
+    }
+
+    const actionType = String(req.body?.actionType ?? "").trim() as EngagementActionTypeDB;
+    if (actionType !== "continue" && actionType !== "retreat") {
+      return res.status(400).json({ error: "Invalid actionType" });
+    }
+
+    const [me] = await db
+      .select({ id: gamePlayers.id })
+      .from(gamePlayers)
+      .where(and(eq(gamePlayers.gameId, roomId), eq(gamePlayers.oderId, oderId)));
+    if (!me) {
+      return res.status(404).json({ error: "Player not found" });
+    }
+
+    const [eng] = await db
+      .select()
+      .from(engagements)
+      .where(and(eq(engagements.gameId, roomId), eq(engagements.id, engagementId)));
+    if (!eng) {
+      return res.status(404).json({ error: "Engagement not found" });
+    }
+    if ((eng.state as any) === "resolved") {
+      return res.status(409).json({ error: "Engagement already resolved" });
+    }
+
+    const isParticipant = me.id === eng.attackerId || me.id === eng.defenderId;
+    if (!isParticipant) {
+      return res.status(403).json({ error: "Not a participant" });
+    }
+
+    const [room] = await db
+      .select({ turn: gameRooms.currentTurn })
+      .from(gameRooms)
+      .where(eq(gameRooms.id, roomId));
+    const turn = room?.turn ?? 1;
+
+    await db
+      .delete(engagementActions)
+      .where(and(eq(engagementActions.gameId, roomId), eq(engagementActions.engagementId, engagementId), eq(engagementActions.playerId, me.id), eq(engagementActions.turn, turn)));
+
+    const [row] = await db
+      .insert(engagementActions)
+      .values({
+        gameId: roomId,
+        engagementId,
+        playerId: me.id,
+        turn,
+        actionType,
+        data: null,
+        resolved: false,
+      })
+      .returning();
+
+    res.json({ success: true, action: row });
   });
 
   app.get("/api/rooms/:id/diplomacy", async (req, res) => {
@@ -960,8 +1447,8 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
 
       const [room] = await db
         .select({
-          aiPlayerCount: gameRooms.aiPlayerCount,
           aiDifficulty: gameRooms.aiDifficulty,
+          maxPlayers: gameRooms.maxPlayers,
           mapWidth: gameRooms.mapWidth,
           mapHeight: gameRooms.mapHeight,
         })
@@ -1095,7 +1582,9 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
       centerCandidates.push({ q: c.q, r: c.r, id, neighborIds });
     }
 
-    const gddCities = loadAppendixA_Cities();
+    const gddCitiesAll = loadAppendixA_Cities();
+    const seatCount = Math.min(room.maxPlayers ?? 20, gddCitiesAll.length, centerCandidates.length);
+    const gddCities = gddCitiesAll.slice(0, seatCount);
     const [firstTurn] = await db
       .select({ turn: gameRooms.currentTurn })
       .from(gameRooms)
@@ -1123,6 +1612,8 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
     const cityCount = Math.min(createdCities.length, centerCandidates.length);
     const stride = Math.max(1, Math.floor(centerCandidates.length / cityCount));
 
+    const seatCities: Array<{ cityId: number; nationId: string; grade: CityGrade; centerTileId: number; clusterTileIds: number[] }> = [];
+
     for (let i = 0; i < cityCount; i++) {
       const city = createdCities[i];
       const pick = centerCandidates[i * stride] ?? centerCandidates[i];
@@ -1131,6 +1622,16 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
 
       const allTileIds = [pick.id, ...pick.neighborIds];
       await db.update(hexTiles).set({ cityId: city.id }).where(and(eq(hexTiles.gameId, roomId), inArray(hexTiles.id, allTileIds)));
+
+      if (city.nationId) {
+        seatCities.push({
+          cityId: city.id,
+          nationId: String(city.nationId),
+          grade: city.grade as CityGrade,
+          centerTileId: pick.id,
+          clusterTileIds: allTileIds,
+        });
+      }
 
       const seed = gddCities[i];
       if (seed) {
@@ -1145,7 +1646,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
           .where(and(eq(hexTiles.gameId, roomId), eq(hexTiles.id, pick.id)));
       }
 
-      const stats = CityGradeStats[city.grade];
+      const stats = CityGradeStats[city.grade as CityGrade];
       await db.insert(news).values({
         gameId: roomId,
         turn,
@@ -1157,96 +1658,66 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
       });
     }
 
-    if (room?.aiPlayerCount && room.aiPlayerCount > 0) {
-      const capitalNationRows = await db
-        .select({ nationId: cities.nationId })
-        .from(cities)
-        .where(and(eq(cities.gameId, roomId), eq(cities.grade, "capital"), isNotNull(cities.nationId)));
-      const capitalNationIds = Array.from(new Set(capitalNationRows.map((r) => String(r.nationId))));
+    const seatNationIds = Array.from(new Set(seatCities.map((c) => c.nationId)));
+    const nationRows = seatNationIds.length
+      ? await db
+          .select({ nationId: gameNations.nationId, color: gameNations.color })
+          .from(gameNations)
+          .where(and(eq(gameNations.gameId, roomId), inArray(gameNations.nationId, seatNationIds)))
+      : [];
+    const colorByNation = new Map<string, string>(nationRows.map((n) => [String(n.nationId), String(n.color)]));
 
-      const availableNations = capitalNationIds.length > 0
-        ? await db
-            .select()
-            .from(gameNations)
-            .where(and(eq(gameNations.gameId, roomId), inArray(gameNations.nationId, capitalNationIds)))
-        : await db.select().from(gameNations).where(eq(gameNations.gameId, roomId));
+    const aiDifficulty = (room.aiDifficulty ?? "normal") as AIDifficulty;
+    const aiPlayerRows = seatCities.map((seat) => ({
+      gameId: roomId,
+      nationId: seat.nationId,
+      isAI: true,
+      aiDifficulty,
+      color: colorByNation.get(seat.nationId) ?? "#6b7280",
+    }));
 
-      const shuffledNations = availableNations.slice().sort(() => Math.random() - 0.5);
-      const nationsForAI = shuffledNations.slice(0, Math.min(room.aiPlayerCount, shuffledNations.length));
+    if (aiPlayerRows.length > 0) {
+      const insertedAI = await db
+        .insert(gamePlayers)
+        .values(aiPlayerRows)
+        .returning({ id: gamePlayers.id });
 
-      const aiDifficulty = (room.aiDifficulty ?? "normal") as AIDifficulty;
-      const aiPlayerRows = nationsForAI.map((nation: { nationId: string; color: string }) => ({
-        gameId: roomId,
-        nationId: nation.nationId,
-        isAI: true,
-        aiDifficulty,
-        color: nation.color,
-        gold: 1000,
-        food: 1000,
-        espionagePower: 50,
-      }));
+      const count = Math.min(insertedAI.length, seatCities.length);
+      for (let i = 0; i < count; i++) {
+        const aiPlayer = insertedAI[i];
+        const seat = seatCities[i];
 
-      if (aiPlayerRows.length > 0) {
-        const insertedAI = await db.insert(gamePlayers).values(aiPlayerRows).returning();
-        
-        // AI 플레이어에게 해당 국가의 수도만 할당 (나머지 도시는 인간 플레이어용)
-        for (const aiPlayer of insertedAI) {
-          if (!aiPlayer.nationId) continue;
-          
-          // 해당 국가의 수도만 찾기 (capital 등급)
-          const [capitalCity] = await db
-            .select()
-            .from(cities)
-            .where(and(
-              eq(cities.gameId, roomId), 
-              eq(cities.nationId, aiPlayer.nationId),
-              eq(cities.grade, "capital")
-            ));
-          
-          if (!capitalCity) continue;
-          
-          // 수도 소유권만 할당
-          await db.update(cities).set({ ownerId: aiPlayer.id }).where(eq(cities.id, capitalCity.id));
-          
-          // 도시 클러스터 타일 소유권 할당
-          if (capitalCity.centerTileId) {
-            const [centerTile] = await db.select().from(hexTiles).where(eq(hexTiles.id, capitalCity.centerTileId));
-            if (centerTile) {
-              // 중앙 타일 + 주변 6타일 소유권 설정
-              const clusterTiles = await db
-                .select()
-                .from(hexTiles)
-                .where(and(eq(hexTiles.gameId, roomId), eq(hexTiles.cityId, capitalCity.id)));
-              
-              for (const tile of clusterTiles) {
-                await db.update(hexTiles).set({ ownerId: aiPlayer.id }).where(eq(hexTiles.id, tile.id));
-                
-                // 시야 설정 (fogOfWar)
-                const existingFog = Array.isArray(tile.fogOfWar) ? tile.fogOfWar as number[] : [];
-                if (!existingFog.includes(aiPlayer.id)) {
-                  await db.update(hexTiles)
-                    .set({ fogOfWar: [...existingFog, aiPlayer.id] })
-                    .where(eq(hexTiles.id, tile.id));
-                }
-              }
-              
-              // 초기 병력 배치
-              const initialTroops = 500; // 수도는 500
-              await db.insert(units).values({
-                gameId: roomId,
-                tileId: capitalCity.centerTileId,
-                cityId: capitalCity.id,
-                ownerId: aiPlayer.id,
-                unitType: "infantry",
-                count: initialTroops,
-              });
-              
-              // 타일 병력 수 동기화
-              await db.update(hexTiles)
-                .set({ troops: initialTroops })
-                .where(eq(hexTiles.id, capitalCity.centerTileId));
-            }
-          }
+        await db.update(cities).set({ ownerId: aiPlayer.id }).where(eq(cities.id, seat.cityId));
+        await db.update(hexTiles)
+          .set({ ownerId: aiPlayer.id })
+          .where(and(eq(hexTiles.gameId, roomId), inArray(hexTiles.id, seat.clusterTileIds)));
+
+        const stats = CityGradeStats[seat.grade];
+        const initialTroops = stats.initialTroops;
+        await db.insert(units).values({
+          gameId: roomId,
+          tileId: seat.centerTileId,
+          cityId: seat.cityId,
+          ownerId: aiPlayer.id,
+          unitType: "infantry" satisfies UnitTypeDB,
+          count: initialTroops,
+        });
+
+        await db.update(hexTiles)
+          .set({ troops: initialTroops })
+          .where(eq(hexTiles.id, seat.centerTileId));
+
+        for (const tid of seat.clusterTileIds) {
+          const [tile] = await db
+            .select({ fogOfWar: hexTiles.fogOfWar })
+            .from(hexTiles)
+            .where(and(eq(hexTiles.gameId, roomId), eq(hexTiles.id, tid)));
+          const existingFog = Array.isArray(tile?.fogOfWar) ? (tile!.fogOfWar as number[]) : [];
+          const next = Array.from(new Set<number>([...existingFog, aiPlayer.id]));
+          await db
+            .update(hexTiles)
+            .set({ fogOfWar: next })
+            .where(and(eq(hexTiles.gameId, roomId), eq(hexTiles.id, tid)));
         }
       }
     }

@@ -57,6 +57,8 @@ export function TradePanel({ roomId, currentPlayerId, players, myGold, myFood }:
   const [requestUnitAmount, setRequestUnitAmount] = useState(0);
   const { toast } = useToast();
 
+  const NONE_VALUE = "__none__";
+
   const unitTypeLabels: Record<UnitTypeDB, string> = {
     infantry: "보병",
     cavalry: "기병",
@@ -335,12 +337,15 @@ export function TradePanel({ roomId, currentPlayerId, players, myGold, myFood }:
           <div className="grid grid-cols-2 gap-4">
             <div>
               <Label>제안할 특산물</Label>
-              <Select value={offerSpecialtyType} onValueChange={(v) => setOfferSpecialtyType(v as any)}>
+              <Select
+                value={offerSpecialtyType || NONE_VALUE}
+                onValueChange={(v) => setOfferSpecialtyType(v === NONE_VALUE ? "" : (v as any))}
+              >
                 <SelectTrigger>
                   <SelectValue placeholder="선택 안함" />
                 </SelectTrigger>
                 <SelectContent>
-                  <SelectItem value="">선택 안함</SelectItem>
+                  <SelectItem value={NONE_VALUE}>선택 안함</SelectItem>
                   {(Object.keys(SpecialtyStats) as SpecialtyType[]).map((k) => (
                     <SelectItem key={k} value={k}>{SpecialtyStats[k].nameKo}</SelectItem>
                   ))}
@@ -356,12 +361,15 @@ export function TradePanel({ roomId, currentPlayerId, players, myGold, myFood }:
           <div className="grid grid-cols-2 gap-4">
             <div>
               <Label>제안할 병력</Label>
-              <Select value={offerUnitType} onValueChange={(v) => setOfferUnitType(v as any)}>
+              <Select
+                value={offerUnitType || NONE_VALUE}
+                onValueChange={(v) => setOfferUnitType(v === NONE_VALUE ? "" : (v as any))}
+              >
                 <SelectTrigger>
                   <SelectValue placeholder="선택 안함" />
                 </SelectTrigger>
                 <SelectContent>
-                  <SelectItem value="">선택 안함</SelectItem>
+                  <SelectItem value={NONE_VALUE}>선택 안함</SelectItem>
                   {( ["infantry","cavalry","archer","siege","navy","spy"] as UnitTypeDB[] ).map((k) => (
                     <SelectItem key={k} value={k}>{unitTypeLabels[k]}</SelectItem>
                   ))}
@@ -388,12 +396,15 @@ export function TradePanel({ roomId, currentPlayerId, players, myGold, myFood }:
           <div className="grid grid-cols-2 gap-4">
             <div>
               <Label>요청할 특산물</Label>
-              <Select value={requestSpecialtyType} onValueChange={(v) => setRequestSpecialtyType(v as any)}>
+              <Select
+                value={requestSpecialtyType || NONE_VALUE}
+                onValueChange={(v) => setRequestSpecialtyType(v === NONE_VALUE ? "" : (v as any))}
+              >
                 <SelectTrigger>
                   <SelectValue placeholder="선택 안함" />
                 </SelectTrigger>
                 <SelectContent>
-                  <SelectItem value="">선택 안함</SelectItem>
+                  <SelectItem value={NONE_VALUE}>선택 안함</SelectItem>
                   {(Object.keys(SpecialtyStats) as SpecialtyType[]).map((k) => (
                     <SelectItem key={k} value={k}>{SpecialtyStats[k].nameKo}</SelectItem>
                   ))}
@@ -409,12 +420,15 @@ export function TradePanel({ roomId, currentPlayerId, players, myGold, myFood }:
           <div className="grid grid-cols-2 gap-4">
             <div>
               <Label>요청할 병력</Label>
-              <Select value={requestUnitType} onValueChange={(v) => setRequestUnitType(v as any)}>
+              <Select
+                value={requestUnitType || NONE_VALUE}
+                onValueChange={(v) => setRequestUnitType(v === NONE_VALUE ? "" : (v as any))}
+              >
                 <SelectTrigger>
                   <SelectValue placeholder="선택 안함" />
                 </SelectTrigger>
                 <SelectContent>
-                  <SelectItem value="">선택 안함</SelectItem>
+                  <SelectItem value={NONE_VALUE}>선택 안함</SelectItem>
                   {( ["infantry","cavalry","archer","siege","navy","spy"] as UnitTypeDB[] ).map((k) => (
                     <SelectItem key={k} value={k}>{unitTypeLabels[k]}</SelectItem>
                   ))}
@@ -537,12 +551,15 @@ export function TradePanel({ roomId, currentPlayerId, players, myGold, myFood }:
                         <div className="grid grid-cols-2 gap-3">
                           <div>
                             <Label>특산물</Label>
-                            <Select value={counterOfferSpecialtyType} onValueChange={(v) => setCounterOfferSpecialtyType(v as any)}>
+                            <Select
+                              value={counterOfferSpecialtyType || NONE_VALUE}
+                              onValueChange={(v) => setCounterOfferSpecialtyType(v === NONE_VALUE ? "" : (v as any))}
+                            >
                               <SelectTrigger>
                                 <SelectValue placeholder="선택 안함" />
                               </SelectTrigger>
                               <SelectContent>
-                                <SelectItem value="">선택 안함</SelectItem>
+                                <SelectItem value={NONE_VALUE}>선택 안함</SelectItem>
                                 {(Object.keys(SpecialtyStats) as SpecialtyType[]).map((k) => (
                                   <SelectItem key={k} value={k}>{SpecialtyStats[k].nameKo}</SelectItem>
                                 ))}
@@ -558,12 +575,15 @@ export function TradePanel({ roomId, currentPlayerId, players, myGold, myFood }:
                         <div className="grid grid-cols-2 gap-3">
                           <div>
                             <Label>병력</Label>
-                            <Select value={counterOfferUnitType} onValueChange={(v) => setCounterOfferUnitType(v as any)}>
+                            <Select
+                              value={counterOfferUnitType || NONE_VALUE}
+                              onValueChange={(v) => setCounterOfferUnitType(v === NONE_VALUE ? "" : (v as any))}
+                            >
                               <SelectTrigger>
                                 <SelectValue placeholder="선택 안함" />
                               </SelectTrigger>
                               <SelectContent>
-                                <SelectItem value="">선택 안함</SelectItem>
+                                <SelectItem value={NONE_VALUE}>선택 안함</SelectItem>
                                 {( ["infantry","cavalry","archer","siege","navy","spy"] as UnitTypeDB[] ).map((k) => (
                                   <SelectItem key={k} value={k}>{unitTypeLabels[k]}</SelectItem>
                                 ))}

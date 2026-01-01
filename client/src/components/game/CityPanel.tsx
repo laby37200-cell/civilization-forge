@@ -22,6 +22,7 @@ interface CityPanelProps {
   onRecruit: () => void;
   onManage: () => void;
   onSubmitDefenseStrategy?: (cityId: number, strategy: string) => void;
+  incomingAttack?: { attackerName: string; strategyHint: string | null } | null;
   onSubmitCivilWar?: (payload: { nameKo: string; name?: string; color?: string }) => void;
 }
 
@@ -96,7 +97,7 @@ function HappinessIndicator({ happiness }: { happiness: number }) {
   );
 }
 
-export function CityPanel({ city, troops, buildings, onBuild, onRecruit, onManage, onSubmitDefenseStrategy, onSubmitCivilWar }: CityPanelProps) {
+export function CityPanel({ city, troops, buildings, onBuild, onRecruit, onManage, onSubmitDefenseStrategy, incomingAttack, onSubmitCivilWar }: CityPanelProps) {
   if (!city) {
     return (
       <Card className="h-full">
@@ -234,34 +235,49 @@ export function CityPanel({ city, troops, buildings, onBuild, onRecruit, onManag
 
             <Separator />
 
-            <div className="space-y-2">
-              <div className="flex items-center justify-between">
-                <h4 className="text-sm font-medium flex items-center gap-1">
-                  <Swords className="w-4 h-4" />
-                  방어 전략
-                </h4>
+            {incomingAttack ? (
+              <div className="space-y-2">
+                <div className="flex items-center justify-between">
+                  <h4 className="text-sm font-medium flex items-center gap-1">
+                    <Swords className="w-4 h-4" />
+                    방어 전략
+                  </h4>
+                  <Badge variant="destructive" className="text-xs">
+                    공격 경보
+                  </Badge>
+                </div>
+
+                <div className="text-xs text-muted-foreground">
+                  공격자: {incomingAttack.attackerName}
+                </div>
+                {incomingAttack.strategyHint ? (
+                  <div className="text-xs">
+                    상대 공격전략(추정): <span className="font-medium">{incomingAttack.strategyHint}</span>
+                  </div>
+                ) : null}
+
+                <Textarea
+                  value={defenseStrategy}
+                  onChange={(e) => setDefenseStrategy(e.target.value)}
+                  placeholder="이번 턴 방어 전략을 입력하세요 (공격받을 때 적용)"
+                  className="min-h-[72px]"
+                />
+                <Button
+                  size="sm"
+                  variant="secondary"
+                  className="w-full"
+                  disabled={!onSubmitDefenseStrategy}
+                  onClick={() => {
+                    if (!onSubmitDefenseStrategy) return;
+                    const cityIdNum = Number(city.id);
+                    if (!Number.isFinite(cityIdNum)) return;
+                    onSubmitDefenseStrategy(cityIdNum, defenseStrategy);
+                  }}
+                >
+                  방어 전략 제출
+                </Button>
               </div>
-              <Textarea
-                value={defenseStrategy}
-                onChange={(e) => setDefenseStrategy(e.target.value)}
-                placeholder="이번 턴 방어 전략을 입력하세요 (공격받을 때 적용)"
-                className="min-h-[72px]"
-              />
-              <Button
-                size="sm"
-                variant="secondary"
-                className="w-full"
-                disabled={!onSubmitDefenseStrategy}
-                onClick={() => {
-                  if (!onSubmitDefenseStrategy) return;
-                  const cityIdNum = Number(city.id);
-                  if (!Number.isFinite(cityIdNum)) return;
-                  onSubmitDefenseStrategy(cityIdNum, defenseStrategy);
-                }}
-              >
-                방어 전략 제출
-              </Button>
-            </div>
+            ) : null}
 
             <Separator />
 

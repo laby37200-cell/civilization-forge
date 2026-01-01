@@ -77,7 +77,11 @@ export function ChatPanel({ messages, currentPlayerId, players, onSendMessage }:
 
   return (
     <div className="h-full flex flex-col bg-card rounded-md border" data-testid="chat-panel">
-      <Tabs value={activeChannel} onValueChange={(v) => setActiveChannel(v as ChatMessage["channel"])}>
+      <Tabs
+        value={activeChannel}
+        onValueChange={(v) => setActiveChannel(v as ChatMessage["channel"])}
+        className="flex-1 flex flex-col min-h-0"
+      >
         <TabsList className="w-full justify-start rounded-none border-b bg-transparent p-0">
           <TabsTrigger
             value="global"
@@ -113,7 +117,7 @@ export function ChatPanel({ messages, currentPlayerId, players, onSendMessage }:
           </TabsTrigger>
         </TabsList>
 
-        <TabsContent value={activeChannel} className="flex-1 m-0">
+        <TabsContent value={activeChannel} className="flex-1 m-0 min-h-0">
           {activeChannel === "private" && (
             <div className="p-2 border-b">
               <div className="text-xs text-muted-foreground mb-1">대화 상대</div>
@@ -131,7 +135,7 @@ export function ChatPanel({ messages, currentPlayerId, players, onSendMessage }:
               </select>
             </div>
           )}
-          <ScrollArea className="h-48">
+          <ScrollArea className="flex-1 min-h-0">
             <div className="p-3 space-y-3">
               {filteredMessages.length === 0 ? (
                 <div className="text-center text-muted-foreground py-8 text-sm">

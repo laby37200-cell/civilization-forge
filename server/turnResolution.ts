@@ -15,6 +15,9 @@ import {
   trades,
   spies,
   aiMemory,
+  autoMoves,
+  engagements,
+  engagementActions,
   CityGradeStats,
   UnitStats,
   BuildingStats,
@@ -30,7 +33,8 @@ import {
   type Spy,
   type SpyMission,
   type SpyLocationType,
-  type NewsVisibilityDB
+  type NewsVisibilityDB,
+  type EngagementActionTypeDB
 } from "@shared/schema";
 import { eq, and, sql, gt, lt, or, ne, inArray, isNotNull } from "drizzle-orm";
 import { generateNewsNarrative, judgeBattle } from "./llm";
@@ -41,6 +45,206 @@ interface TurnPhaseResult {
   resourceUpdates?: TurnResolutionResult["resourceUpdates"];
   battleResults?: TurnResolutionResult["battleResults"];
   victory?: TurnResolutionResult["victory"];
+}
+
+async function areAlliesOrSameNation(gameId: number, a: number, b: number): Promise<boolean> {
+  if (a === b) return true;
+
+  const rows = await db
+    .select({ id: gamePlayers.id, nationId: gamePlayers.nationId })
+    .from(gamePlayers)
+    .where(and(eq(gamePlayers.gameId, gameId), inArray(gamePlayers.id, [a, b])));
+  const nationById = new Map<number, string | null>(rows.map((r) => [r.id, (r.nationId as any) ?? null]));
+  const na = nationById.get(a) ?? null;
+  const nb = nationById.get(b) ?? null;
+  if (na && nb && na === nb) return true;
+
+  const [rel] = await db
+    .select({ id: diplomacy.id })
+    .from(diplomacy)
+    .where(
+      and(
+        eq(diplomacy.gameId, gameId),
+        eq(diplomacy.status, "alliance" as any),
+        or(
+          and(eq(diplomacy.player1Id, a), eq(diplomacy.player2Id, b)),
+          and(eq(diplomacy.player1Id, b), eq(diplomacy.player2Id, a))
+        )
+      )
+    );
+  return Boolean(rel);
+}
+
+async function getRelationFlags(gameId: number, a: number, b: number): Promise<{ friendly: boolean; atWar: boolean }> {
+  if (a === b) return { friendly: true, atWar: false };
+
+  const rows = await db
+    .select({ id: gamePlayers.id, nationId: gamePlayers.nationId })
+    .from(gamePlayers)
+    .where(and(eq(gamePlayers.gameId, gameId), inArray(gamePlayers.id, [a, b])));
+  const nationById = new Map<number, string | null>(rows.map((r) => [r.id, (r.nationId as any) ?? null]));
+  const na = nationById.get(a) ?? null;
+  const nb = nationById.get(b) ?? null;
+  if (na && nb && na === nb) return { friendly: true, atWar: false };
+
+  const [rel] = await db
+    .select({ status: diplomacy.status })
+    .from(diplomacy)
+    .where(
+      and(
+        eq(diplomacy.gameId, gameId),
+        or(
+          and(eq(diplomacy.player1Id, a), eq(diplomacy.player2Id, b)),
+          and(eq(diplomacy.player1Id, b), eq(diplomacy.player2Id, a))
+        )
+      )
+    );
+
+  const status = (rel?.status ?? "neutral") as any;
+  const friendly = status === "alliance";
+  const atWar = status === "war";
+  return { friendly, atWar };
+}
+
+async function upsertEngagement(params: {
+  gameId: number;
+  tileId: number;
+  attackerId: number;
+  defenderId: number;
+  attackerFromTileId: number;
+  turn: number;
+}): Promise<void> {
+  const [existing] = await db
+    .select({ id: engagements.id, attackerId: engagements.attackerId, defenderId: engagements.defenderId, state: engagements.state })
+    .from(engagements)
+    .where(and(eq(engagements.gameId, params.gameId), eq(engagements.tileId, params.tileId), ne(engagements.state, "resolved" as any)))
+    .limit(1);
+
+  if (existing) {
+    return;
+  }
+
+  await db.insert(engagements).values({
+    gameId: params.gameId,
+    tileId: params.tileId,
+    attackerId: params.attackerId,
+    defenderId: params.defenderId,
+    attackerFromTileId: params.attackerFromTileId,
+    startedTurn: params.turn,
+    lastResolvedTurn: 0,
+    state: "engaged" as any,
+  });
+}
+
+async function findNearestNonOwnerTile(
+  gameId: number,
+  startTileId: number,
+  forbiddenOwnerId: number,
+  preferredOwnerId: number
+): Promise<number | null> {
+  const tiles = await db
+    .select({ id: hexTiles.id, q: hexTiles.q, r: hexTiles.r, ownerId: hexTiles.ownerId })
+    .from(hexTiles)
+    .where(eq(hexTiles.gameId, gameId));
+
+  const coordById = new Map<number, { q: number; r: number; ownerId: number | null }>();
+  const idByCoord = new Map<string, number>();
+  for (const t of tiles) {
+    coordById.set(t.id, { q: t.q, r: t.r, ownerId: t.ownerId ?? null });
+    idByCoord.set(`${t.q},${t.r}`, t.id);
+  }
+
+  const dirs: Array<[number, number]> = [[1,0],[1,-1],[0,-1],[-1,0],[-1,1],[0,1]];
+  const neigh = (id: number) => {
+    const c = coordById.get(id);
+    if (!c) return [] as number[];
+    const out: number[] = [];
+    for (const [dq, dr] of dirs) {
+      const nid = idByCoord.get(`${c.q + dq},${c.r + dr}`);
+      if (nid != null) out.push(nid);
+    }
+    return out;
+  };
+
+  const q: number[] = [startTileId];
+  const prev = new Map<number, number | null>();
+  prev.set(startTileId, null);
+
+  while (q.length) {
+    const cur = q.shift()!;
+    const c = coordById.get(cur);
+    if (c && cur !== startTileId) {
+      const owner = c.ownerId;
+      if (owner !== forbiddenOwnerId && (owner === preferredOwnerId || owner == null)) {
+        return cur;
+      }
+    }
+    for (const n of neigh(cur)) {
+      if (prev.has(n)) continue;
+      prev.set(n, cur);
+      q.push(n);
+    }
+  }
+
+  return null;
+}
+
+async function displaceUnitsBetweenFormerAllies(gameId: number, a: number, b: number, turn: number): Promise<void> {
+  const rowsAonB = await db
+    .select({ unitId: units.id, tileId: units.tileId })
+    .from(units)
+    .leftJoin(hexTiles, eq(units.tileId, hexTiles.id))
+    .where(and(eq(units.gameId, gameId), eq(units.ownerId, a), eq(hexTiles.ownerId, b)));
+
+  const rowsBonA = await db
+    .select({ unitId: units.id, tileId: units.tileId })
+    .from(units)
+    .leftJoin(hexTiles, eq(units.tileId, hexTiles.id))
+    .where(and(eq(units.gameId, gameId), eq(units.ownerId, b), eq(hexTiles.ownerId, a)));
+
+  const moveOut = async (ownerId: number, forbiddenOwnerId: number, list: Array<{ unitId: number; tileId: number | null }>) => {
+    const byTile = new Map<number, number[]>();
+    for (const r of list) {
+      const tid = r.tileId;
+      if (!tid) continue;
+      const arr = byTile.get(tid) ?? [];
+      arr.push(r.unitId);
+      byTile.set(tid, arr);
+    }
+
+    for (const [fromTileId, unitIds] of byTile) {
+      const dest = await findNearestNonOwnerTile(gameId, fromTileId, forbiddenOwnerId, ownerId);
+      if (!dest) {
+        await db.insert(news).values({
+          gameId,
+          turn,
+          category: "diplomacy",
+          title: "강제 퇴각 실패",
+          content: "동맹 파기로 인해 퇴각이 필요하지만 이동 가능한 타일을 찾지 못했습니다.",
+          visibility: "private" satisfies NewsVisibilityDB,
+          involvedPlayerIds: [ownerId],
+        });
+        continue;
+      }
+
+      await db.update(units).set({ tileId: dest }).where(inArray(units.id, unitIds));
+      await syncTileTroops(gameId, fromTileId);
+      await syncTileTroops(gameId, dest);
+
+      await db.insert(news).values({
+        gameId,
+        turn,
+        category: "diplomacy",
+        title: "강제 퇴각",
+        content: "동맹 파기로 인해 상대 영토에서 가장 가까운 안전지대로 퇴각했습니다.",
+        visibility: "private" satisfies NewsVisibilityDB,
+        involvedPlayerIds: [ownerId],
+      });
+    }
+  };
+
+  await moveOut(a, b, rowsAonB);
+  await moveOut(b, a, rowsBonA);
 }
 
 async function processEspionagePowerGrowth(gameId: number): Promise<void> {
@@ -66,6 +270,132 @@ async function processEspionagePowerGrowth(gameId: number): Promise<void> {
     const growth = 1 + (bonusByPlayer.get(p.id) ?? 0);
     const next = Math.max(0, Math.min(100, current + growth));
     await db.update(gamePlayers).set({ espionagePower: next }).where(eq(gamePlayers.id, p.id));
+  }
+}
+
+async function recomputeFogOfWar(gameId: number) {
+  const tiles = await db
+    .select({ id: hexTiles.id, q: hexTiles.q, r: hexTiles.r })
+    .from(hexTiles)
+    .where(eq(hexTiles.gameId, gameId));
+
+  const tileIdByCoord = new Map<string, number>();
+  for (const t of tiles) {
+    tileIdByCoord.set(`${t.q},${t.r}`, t.id);
+  }
+
+  const directions: Array<[number, number]> = [
+    [1, 0], [1, -1], [0, -1],
+    [-1, 0], [-1, 1], [0, 1],
+  ];
+
+  const neighborsById = new Map<number, number[]>();
+  for (const t of tiles) {
+    const n: number[] = [];
+    for (const [dq, dr] of directions) {
+      const id = tileIdByCoord.get(`${t.q + dq},${t.r + dr}`);
+      if (id != null) n.push(id);
+    }
+    neighborsById.set(t.id, n);
+  }
+
+  const fogByTileId = new Map<number, Set<number>>();
+  for (const t of tiles) {
+    fogByTileId.set(t.id, new Set());
+  }
+
+  const players = await db
+    .select({ id: gamePlayers.id, nationId: gamePlayers.nationId, isEliminated: gamePlayers.isEliminated })
+    .from(gamePlayers)
+    .where(eq(gamePlayers.gameId, gameId));
+
+  const playerById = new Map<number, { id: number; nationId: string | null; isEliminated: boolean | null }>();
+  const nationToPlayerIds = new Map<string, number[]>();
+  for (const p of players) {
+    if (p.id == null) continue;
+    const nationKey = p.nationId == null ? null : String(p.nationId);
+    playerById.set(p.id, { id: p.id, nationId: nationKey, isEliminated: Boolean(p.isEliminated) });
+    if (!nationKey) continue;
+    const arr = nationToPlayerIds.get(nationKey) ?? [];
+    arr.push(p.id);
+    nationToPlayerIds.set(nationKey, arr);
+  }
+
+  const alliances = await db
+    .select({ p1: diplomacy.player1Id, p2: diplomacy.player2Id })
+    .from(diplomacy)
+    .where(and(eq(diplomacy.gameId, gameId), eq(diplomacy.status, "alliance")));
+
+  const alliedTo = new Map<number, Set<number>>();
+  for (const a of alliances) {
+    if (!a.p1 || !a.p2) continue;
+    if (!alliedTo.has(a.p1)) alliedTo.set(a.p1, new Set());
+    if (!alliedTo.has(a.p2)) alliedTo.set(a.p2, new Set());
+    alliedTo.get(a.p1)!.add(a.p2);
+    alliedTo.get(a.p2)!.add(a.p1);
+  }
+
+  const unitTiles = await db
+    .select({ ownerId: units.ownerId, tileId: units.tileId })
+    .from(units)
+    .where(and(eq(units.gameId, gameId), isNotNull(units.ownerId), isNotNull(units.tileId), gt(units.count, 0)));
+  const unitTilesByOwner = new Map<number, Set<number>>();
+  for (const u of unitTiles) {
+    if (u.ownerId == null || u.tileId == null) continue;
+    if (!unitTilesByOwner.has(u.ownerId)) unitTilesByOwner.set(u.ownerId, new Set());
+    unitTilesByOwner.get(u.ownerId)!.add(u.tileId);
+  }
+
+  const cityCenters = await db
+    .select({ ownerId: cities.ownerId, centerTileId: cities.centerTileId })
+    .from(cities)
+    .where(and(eq(cities.gameId, gameId), isNotNull(cities.ownerId), isNotNull(cities.centerTileId)));
+  const cityTilesByOwner = new Map<number, Set<number>>();
+  for (const c of cityCenters) {
+    if (c.ownerId == null || c.centerTileId == null) continue;
+    if (!cityTilesByOwner.has(c.ownerId)) cityTilesByOwner.set(c.ownerId, new Set());
+    cityTilesByOwner.get(c.ownerId)!.add(c.centerTileId);
+  }
+
+  for (const p of Array.from(playerById.values())) {
+    if (p.isEliminated) continue;
+
+    const viewers = new Set<number>();
+    if (p.nationId && nationToPlayerIds.get(p.nationId)) {
+      for (const id of nationToPlayerIds.get(p.nationId)!) viewers.add(id);
+    }
+    viewers.add(p.id);
+
+    const allySet = alliedTo.get(p.id) ?? new Set<number>();
+    for (const allyId of Array.from(allySet.values())) {
+      const ally = playerById.get(allyId);
+      if (ally?.nationId && nationToPlayerIds.get(ally.nationId)) {
+        for (const id of nationToPlayerIds.get(ally.nationId)!) viewers.add(id);
+      } else {
+        viewers.add(allyId);
+      }
+    }
+
+    const sources = new Set<number>();
+    for (const tId of Array.from(unitTilesByOwner.get(p.id)?.values() ?? [])) sources.add(tId);
+    for (const tId of Array.from(cityTilesByOwner.get(p.id)?.values() ?? [])) sources.add(tId);
+
+    for (const centerId of Array.from(sources.values())) {
+      const reveal = [centerId, ...(neighborsById.get(centerId) ?? [])];
+      for (const tileId of reveal) {
+        const s = fogByTileId.get(tileId);
+        if (!s) continue;
+        for (const vId of Array.from(viewers.values())) s.add(vId);
+      }
+    }
+  }
+
+  for (const t of tiles) {
+    const next = Array.from(fogByTileId.get(t.id) ?? new Set<number>());
+    await db
+      .update(hexTiles)
+      .set({ fogOfWar: next })
+      .where(and(eq(hexTiles.gameId, gameId), eq(hexTiles.id, t.id)));
   }
 }
 
@@ -150,20 +480,15 @@ export async function resolveTurn(gameId: number, turn: number): Promise<TurnRes
   result.victory = resolutionResult.victory;
 
   return result;
+
 }
 
 export async function runTurnStart(gameId: number, turn: number): Promise<TurnPhaseResult> {
   const news: TurnPhaseResult["newsItems"] = [];
 
-  // 1) 병력 회복 (병원 효과)
-  const healed = await processTroopHealing(gameId);
-  if (healed.length > 0) {
-    news.push({
-      category: "city",
-      title: "병력 회복",
-      content: `병원에서 병력이 회복되었습니다.`,
-    });
-  }
+  // 4) 자동이동 처리
+  const autoMoveNews = await processAutoMoves(gameId, turn);
+  news.push(...autoMoveNews);
 
   // 2) AI 의사결정 (TODO: implement AI logic)
   const aiActions = await processAIDecisions(gameId, turn);
@@ -179,6 +504,179 @@ export async function runTurnStart(gameId: number, turn: number): Promise<TurnPh
   await processEspionagePowerGrowth(gameId);
 
   return { phase: "t_start", newsItems: news };
+}
+
+async function processAutoMoves(gameId: number, turn: number): Promise<TurnPhaseResult["newsItems"]> {
+  const out: TurnPhaseResult["newsItems"] = [];
+
+  const active = await db
+    .select()
+    .from(autoMoves)
+    .where(and(eq(autoMoves.gameId, gameId), eq(autoMoves.status, "active" as any)));
+
+  for (const o of active) {
+    if (!o.playerId) continue;
+    const path = Array.isArray(o.path) ? (o.path as number[]) : [];
+    const idx = o.pathIndex ?? 0;
+
+    // path: [start,...,target]
+    if (path.length === 0) {
+      await db.update(autoMoves)
+        .set({ status: "canceled" as any, cancelReason: "invalid_path", updatedTurn: turn })
+        .where(eq(autoMoves.id, o.id));
+      out.push({
+        category: "event",
+        title: "자동이동 취소",
+        content: "자동이동 경로가 유효하지 않아 취소되었습니다.",
+        visibility: "private",
+        involvedPlayerIds: [o.playerId],
+      });
+      continue;
+    }
+
+    if (idx >= path.length - 1) {
+      await db.update(autoMoves)
+        .set({ status: "completed" as any, updatedTurn: turn })
+        .where(eq(autoMoves.id, o.id));
+      out.push({
+        category: "event",
+        title: "자동이동 완료",
+        content: "자동이동이 목적지에 도착했습니다.",
+        visibility: "private",
+        involvedPlayerIds: [o.playerId],
+      });
+      continue;
+    }
+
+    const fromTileId = o.currentTileId ?? path[idx];
+    const nextTileId = path[idx + 1];
+    if (!nextTileId) {
+      await db.update(autoMoves)
+        .set({ status: "canceled" as any, cancelReason: "invalid_next", updatedTurn: turn })
+        .where(eq(autoMoves.id, o.id));
+      out.push({
+        category: "event",
+        title: "자동이동 취소",
+        content: "자동이동 경로가 손상되어 취소되었습니다.",
+        visibility: "private",
+        involvedPlayerIds: [o.playerId],
+      });
+      continue;
+    }
+
+    const [nextTile] = await db
+      .select({ ownerId: hexTiles.ownerId })
+      .from(hexTiles)
+      .where(and(eq(hexTiles.gameId, gameId), eq(hexTiles.id, nextTileId)));
+    if (!nextTile) {
+      await db.update(autoMoves)
+        .set({ status: "canceled" as any, cancelReason: "blocked_by_enemy", updatedTurn: turn })
+        .where(eq(autoMoves.id, o.id));
+      out.push({
+        category: "event",
+        title: "자동이동 취소",
+        content: "적 타일 또는 이동 불가로 자동이동이 취소되었습니다.",
+        visibility: "private",
+        involvedPlayerIds: [o.playerId],
+      });
+      continue;
+    }
+
+    if (nextTile.ownerId != null && nextTile.ownerId !== o.playerId) {
+      const rel = await getRelationFlags(gameId, o.playerId, nextTile.ownerId);
+      if (!rel.friendly && !rel.atWar) {
+        await db.update(autoMoves)
+          .set({ status: "canceled" as any, cancelReason: "blocked_by_enemy", updatedTurn: turn })
+          .where(eq(autoMoves.id, o.id));
+        out.push({
+          category: "event",
+          title: "자동이동 취소",
+          content: "적 타일 또는 이동 불가로 자동이동이 취소되었습니다.",
+          visibility: "private",
+          involvedPlayerIds: [o.playerId],
+        });
+        continue;
+      }
+    }
+
+    const occupiers = await db
+      .select({ ownerId: units.ownerId })
+      .from(units)
+      .where(and(eq(units.gameId, gameId), eq(units.tileId, nextTileId), isNotNull(units.ownerId)));
+    let hasHostileUnit = false;
+    for (const r of occupiers) {
+      const oid = r.ownerId;
+      if (!oid || oid === o.playerId) continue;
+      const rel = await getRelationFlags(gameId, o.playerId, oid);
+      if (!rel.friendly) {
+        hasHostileUnit = true;
+        break;
+      }
+    }
+    if (hasHostileUnit) {
+      await db.update(autoMoves)
+        .set({ status: "canceled" as any, cancelReason: "enemy_unit", updatedTurn: turn })
+        .where(eq(autoMoves.id, o.id));
+      out.push({
+        category: "event",
+        title: "자동이동 취소",
+        content: "경로 상 적 유닛이 있어 자동이동이 취소되었습니다.",
+        visibility: "private",
+        involvedPlayerIds: [o.playerId],
+      });
+      continue;
+    }
+
+    const unitType = o.unitType as UnitTypeDB;
+    const amount = o.amount ?? 100;
+    const action: TurnAction = {
+      id: -1,
+      gameId,
+      playerId: o.playerId,
+      turn,
+      actionType: "move" as any,
+      data: { fromTileId, toTileId: nextTileId, units: { [unitType]: amount } },
+      resolved: false,
+    };
+
+    const ok = await processMove(action);
+    if (!ok) {
+      await db.update(autoMoves)
+        .set({ status: "canceled" as any, cancelReason: "move_failed", updatedTurn: turn })
+        .where(eq(autoMoves.id, o.id));
+      out.push({
+        category: "event",
+        title: "자동이동 취소",
+        content: "이동 조건을 만족하지 못해 자동이동이 취소되었습니다.",
+        visibility: "private",
+        involvedPlayerIds: [o.playerId],
+      });
+      continue;
+    }
+
+    const nextIndex = idx + 1;
+    const done = nextIndex >= path.length - 1;
+    await db.update(autoMoves)
+      .set({
+        currentTileId: nextTileId,
+        pathIndex: nextIndex,
+        status: done ? ("completed" as any) : ("active" as any),
+        updatedTurn: turn,
+      })
+      .where(eq(autoMoves.id, o.id));
+
+    if (done) {
+      out.push({
+        category: "event",
+        title: "자동이동 완료",
+        content: "자동이동이 목적지에 도착했습니다.",
+        visibility: "private",
+        involvedPlayerIds: [o.playerId],
+      });
+    }
+  }
+
+  return out;
 }
 
 export async function runActionsPhase(gameId: number, turn: number): Promise<TurnPhaseResult> {
@@ -198,17 +696,23 @@ export async function runActionsPhase(gameId: number, turn: number): Promise<Tur
 
   for (const action of attackActions) {
     try {
-      const battleResult = await processAttack(gameId, turn, action);
-      if (battleResult) {
-        battles.push(battleResult);
-        news.push({
-          category: "battle",
-          title: "전투 발생",
-          content: battleResult.narrative,
-          visibility: "global",
-          involvedPlayerIds: [battleResult.attackerId, battleResult.defenderId],
-        });
-      }
+      // 교전 시스템(v1): attack 액션은 즉시 승패를 내지 않고
+      // 1) 병력을 타일로 이동(겹치면 교전 생성)
+      // 2) 실제 손실/결과는 resolution phase에서 engagements로 처리
+      const d = (action.data ?? {}) as any;
+      const fromTileId = typeof d.fromTileId === "number" ? d.fromTileId : null;
+      const targetTileId = typeof d.targetTileId === "number" ? d.targetTileId : null;
+      if (!action.playerId || !fromTileId || !targetTileId) continue;
+      const moveLike: TurnAction = {
+        id: -1,
+        gameId,
+        playerId: action.playerId,
+        turn,
+        actionType: "move" as any,
+        data: { fromTileId, toTileId: targetTileId, units: d.units ?? {} },
+        resolved: false,
+      };
+      await processMove(moveLike);
     } catch (e) {
       console.error("[TurnResolution] Attack processing error:", e);
     }
@@ -262,6 +766,8 @@ export async function runActionsPhase(gameId: number, turn: number): Promise<Tur
     .update(turnActions)
     .set({ resolved: true })
     .where(and(eq(turnActions.gameId, gameId), eq(turnActions.turn, turn)));
+
+  await recomputeFogOfWar(gameId);
 
   return { phase: "actions", newsItems: news, battleResults: battles };
 }
@@ -321,6 +827,132 @@ export async function runResolutionPhase(gameId: number, turn: number): Promise<
   // GDD 19장: 첩보 결과 처리 (턴 종료 시)
   const espionageNews = await processSpyActions(gameId, turn);
   news.push(...espionageNews);
+
+  const activeEngagements = await db
+    .select()
+    .from(engagements)
+    .where(and(eq(engagements.gameId, gameId), ne(engagements.state, "resolved" as any), lt(engagements.lastResolvedTurn, turn)));
+
+  for (const eng of activeEngagements) {
+    const tileId = eng.tileId;
+    const attackerId = eng.attackerId;
+    const defenderId = eng.defenderId;
+    const attackerFromTileId = eng.attackerFromTileId;
+    if (!tileId || !attackerId || !defenderId || !attackerFromTileId) continue;
+
+    const attackerTroops = await getTileTroops(gameId, tileId, attackerId);
+    const defenderTroops = await getTileTroops(gameId, tileId, defenderId);
+
+    const attackerSum = sumTroops({ ...attackerTroops, spy: 0 });
+    const defenderSum = sumTroops({ ...defenderTroops, spy: 0 });
+
+    if (attackerSum <= 0 || defenderSum <= 0) {
+      await db
+        .update(engagements)
+        .set({ state: "resolved" as any, lastResolvedTurn: turn })
+        .where(eq(engagements.id, eng.id));
+      continue;
+    }
+
+    const actionRows = await db
+      .select({ playerId: engagementActions.playerId, actionType: engagementActions.actionType })
+      .from(engagementActions)
+      .where(and(eq(engagementActions.gameId, gameId), eq(engagementActions.engagementId, eng.id), eq(engagementActions.turn, turn), eq(engagementActions.resolved, false)));
+    const actByPlayer = new Map<number, EngagementActionTypeDB>();
+    for (const a of actionRows) {
+      if (!a.playerId) continue;
+      actByPlayer.set(a.playerId, (a.actionType as any) ?? ("continue" as any));
+    }
+    const attackerChoice = actByPlayer.get(attackerId) ?? ("continue" as any);
+    const defenderChoice = actByPlayer.get(defenderId) ?? ("continue" as any);
+
+    if (attackerChoice === "retreat") {
+      const survivors = await getTileTroops(gameId, tileId, attackerId);
+      await adjustTileUnits(gameId, tileId, attackerId, survivors, -1);
+      await adjustTileUnits(gameId, attackerFromTileId, attackerId, survivors, 1);
+      await syncTileTroops(gameId, tileId);
+      await syncTileTroops(gameId, attackerFromTileId);
+
+      await db
+        .update(engagementActions)
+        .set({ resolved: true })
+        .where(and(eq(engagementActions.gameId, gameId), eq(engagementActions.engagementId, eng.id), eq(engagementActions.turn, turn)));
+
+      await db
+        .update(engagements)
+        .set({ state: "resolved" as any, lastResolvedTurn: turn })
+        .where(eq(engagements.id, eng.id));
+      continue;
+    }
+
+    if (defenderChoice === "retreat") {
+      const dest = await findNearestNonOwnerTile(gameId, tileId, attackerId, defenderId);
+      if (dest) {
+        const survivors = await getTileTroops(gameId, tileId, defenderId);
+        await adjustTileUnits(gameId, tileId, defenderId, survivors, -1);
+        await adjustTileUnits(gameId, dest, defenderId, survivors, 1);
+        await syncTileTroops(gameId, tileId);
+        await syncTileTroops(gameId, dest);
+      }
+
+      await db
+        .update(engagementActions)
+        .set({ resolved: true })
+        .where(and(eq(engagementActions.gameId, gameId), eq(engagementActions.engagementId, eng.id), eq(engagementActions.turn, turn)));
+
+      await db
+        .update(engagements)
+        .set({ state: "resolved" as any, lastResolvedTurn: turn })
+        .where(eq(engagements.id, eng.id));
+      continue;
+    }
+
+    const [tile] = await db.select().from(hexTiles).where(eq(hexTiles.id, tileId));
+    if (!tile) continue;
+
+    const battleResult = await judgeBattle({
+      attackerTroops,
+      defenderTroops,
+      attackerStrategy: "",
+      defenderStrategy: "",
+      terrain: tile.terrain,
+      isCity: Boolean(tile.cityId),
+      cityDefenseLevel: 0,
+    });
+
+    await applyBattleLossesToTile(gameId, tileId, attackerId, battleResult.attackerLosses);
+    await applyBattleLossesToTile(gameId, tileId, defenderId, battleResult.defenderLosses);
+    await syncTileTroops(gameId, tileId);
+
+    const attackerAfter = sumTroops({ ...(await getTileTroops(gameId, tileId, attackerId)), spy: 0 });
+    const defenderAfter = sumTroops({ ...(await getTileTroops(gameId, tileId, defenderId)), spy: 0 });
+
+    if (attackerAfter <= 0 || defenderAfter <= 0) {
+      if (defenderAfter <= 0) {
+        await db.update(hexTiles).set({ ownerId: attackerId }).where(eq(hexTiles.id, tileId));
+        if (tile.cityId) {
+          await db.update(cities).set({ ownerId: attackerId }).where(eq(cities.id, tile.cityId));
+          await updateCityCluster(gameId, tile.cityId, attackerId);
+        }
+        await updateFogOfWar(gameId, attackerId, tileId);
+      }
+
+      await db
+        .update(engagements)
+        .set({ state: "resolved" as any, lastResolvedTurn: turn })
+        .where(eq(engagements.id, eng.id));
+    } else {
+      await db
+        .update(engagements)
+        .set({ state: "engaged" as any, lastResolvedTurn: turn })
+        .where(eq(engagements.id, eng.id));
+    }
+
+    await db
+      .update(engagementActions)
+      .set({ resolved: true })
+      .where(and(eq(engagementActions.gameId, gameId), eq(engagementActions.engagementId, eng.id), eq(engagementActions.turn, turn)));
+  }
 
   // 4) 승리 조건 판정
   const victory = await checkVictoryConditions(gameId, turn);
@@ -522,6 +1154,10 @@ async function processDiplomacyPhase(gameId: number, turn: number) {
     // 동맹 체결 시 시야 공유
     if (newStatus === "alliance" && oldStatus !== "alliance") {
       await shareAllianceVisionInternal(gameId, relation.player1Id, relation.player2Id);
+    }
+
+    if (oldStatus === "alliance" && newStatus !== "alliance") {
+      await displaceUnitsBetweenFormerAllies(gameId, relation.player1Id, relation.player2Id, turn);
     }
 
     // 뉴스 생성
@@ -802,7 +1438,7 @@ export async function deploySpy(gameId: number, spyId: number, mission: SpyMissi
 
   await db
     .update(spies)
-    .set({ mission, locationType: targetLocationType, locationId: targetLocationId, lastActiveTurn: turn })
+    .set({ mission, locationType: targetLocationType, locationId: targetLocationId, deployedTurn: turn, lastActiveTurn: turn })
     .where(eq(spies.id, spyId));
 }
 
@@ -2172,12 +2808,26 @@ async function processAttack(
   if (!data?.fromTileId) return null;
 
   const [fromTile] = await db.select().from(hexTiles).where(eq(hexTiles.id, data.fromTileId));
-  if (!fromTile || fromTile.ownerId !== action.playerId) return null;
+  if (!fromTile) return null;
 
   const [targetTile] = await db.select().from(hexTiles).where(eq(hexTiles.id, data.targetTileId));
-  if (!targetTile || !targetTile.ownerId) return null;
+  if (!targetTile) return null;
 
-  const defenderTroops = await getTileTroops(gameId, targetTile.id, targetTile.ownerId);
+  // 방어자 결정:
+  // - 타일 소유자가 있으면 그 소유자
+  // - 소유자 없으면(중립) 타일 위 유닛 소유자(단일)로 전투 가능
+  let defenderId: number | null = targetTile.ownerId ?? null;
+  if (!defenderId) {
+    const occupiers = await db
+      .select({ ownerId: units.ownerId })
+      .from(units)
+      .where(and(eq(units.gameId, gameId), eq(units.tileId, targetTile.id), isNotNull(units.ownerId), ne(units.ownerId, action.playerId!)));
+    const unique = Array.from(new Set<number>(occupiers.map((o) => o.ownerId!).filter((x): x is number => typeof x === "number")));
+    if (unique.length !== 1) return null;
+    defenderId = unique[0];
+  }
+
+  const defenderTroops = await getTileTroops(gameId, targetTile.id, defenderId);
 
   const requestedTroops: Record<UnitTypeDB, number> = {
     ...data.units,
@@ -2212,7 +2862,7 @@ async function processAttack(
   const [defenderPlayer] = await db
     .select({ isAI: gamePlayers.isAI })
     .from(gamePlayers)
-    .where(eq(gamePlayers.id, targetTile.ownerId));
+    .where(eq(gamePlayers.id, defenderId));
   let defenderStrategy = "";
   if (defenderPlayer?.isAI) {
     defenderStrategy = isCity
@@ -2225,7 +2875,7 @@ async function processAttack(
       .where(and(
         eq(turnActions.gameId, gameId),
         eq(turnActions.turn, turn),
-        eq(turnActions.playerId, targetTile.ownerId),
+        eq(turnActions.playerId, defenderId),
         eq(turnActions.actionType, "defense" as any),
         eq(turnActions.resolved, false)
       ))
@@ -2253,7 +2903,7 @@ async function processAttack(
       gameId,
       turn,
       attackerId: action.playerId,
-      defenderId: targetTile.ownerId,
+      defenderId,
       tileId: targetTile.id,
       cityId: targetTile.cityId,
       attackerTroops,
@@ -2268,7 +2918,7 @@ async function processAttack(
     .returning();
 
   if (battleResult.result === "attacker_win") {
-    await applyBattleLossesToTile(gameId, targetTile.id, targetTile.ownerId, battleResult.defenderLosses);
+    await applyBattleLossesToTile(gameId, targetTile.id, defenderId, battleResult.defenderLosses);
 
     // Move surviving attacker troops onto target tile.
     const survivors: Record<UnitTypeDB, number> = {
@@ -2288,10 +2938,7 @@ async function processAttack(
       })
       .where(eq(hexTiles.id, targetTile.id));
 
-    await db
-      .update(units)
-      .set({ ownerId: action.playerId })
-      .where(and(eq(units.gameId, gameId), eq(units.tileId, targetTile.id)));
+    // 공격 승리 시: 생존 방어 유닛은 '퇴각/소멸'로 간주(현 구현 단순화)
 
     await adjustTileUnits(gameId, targetTile.id, action.playerId, survivors, 1);
 
@@ -2317,7 +2964,7 @@ async function processAttack(
       // TODO: 공격자의 수도 이전 여부 결정 (GDD 14장)
     }
   } else {
-    await applyBattleLossesToTile(gameId, targetTile.id, targetTile.ownerId, battleResult.defenderLosses);
+    await applyBattleLossesToTile(gameId, targetTile.id, defenderId, battleResult.defenderLosses);
 
     const survivors: Record<UnitTypeDB, number> = {
       infantry: Math.max(0, attackerTroops.infantry - (battleResult.attackerLosses.infantry ?? 0)),
@@ -2349,7 +2996,7 @@ async function processAttack(
             type: "battle",
             data: {
               attackerId: action.playerId,
-              defenderId: targetTile.ownerId,
+              defenderId,
               result: battleResult.result,
               terrain: targetTile.terrain,
             },
@@ -2357,13 +3004,13 @@ async function processAttack(
           return llm === "새로운 소식이 전해졌습니다." ? battleResult.narrative : llm;
         })()),
       visibility: "global" satisfies NewsVisibilityDB,
-      involvedPlayerIds: [action.playerId, targetTile.ownerId],
+      involvedPlayerIds: [action.playerId, defenderId],
     });
 
   return {
     id: insertedBattle.id,
     attackerId: action.playerId,
-    defenderId: targetTile.ownerId,
+    defenderId,
     result: battleResult.result,
     narrative: battleResult.narrative,
   };
@@ -2452,7 +3099,7 @@ async function processLoot(gameId: number, attackerId: number, targetTile: any):
   return { goldStolen, foodStolen };
 }
 
-async function processMove(action: TurnAction): Promise<void> {
+async function processMove(action: TurnAction): Promise<boolean> {
   const data = action.data as {
     fromTileId: number;
     toTileId: number;
@@ -2460,15 +3107,48 @@ async function processMove(action: TurnAction): Promise<void> {
     units?: Partial<Record<UnitTypeDB, number>>;
   };
 
-  if (!data?.fromTileId || !data?.toTileId) return;
+  if (!data?.fromTileId || !data?.toTileId) return false;
 
   const [fromTile] = await db.select().from(hexTiles).where(eq(hexTiles.id, data.fromTileId));
   const [toTile] = await db.select().from(hexTiles).where(eq(hexTiles.id, data.toTileId));
 
-  if (!fromTile || !toTile) return;
-  if (fromTile.ownerId !== action.playerId) return;
+  if (!fromTile || !toTile) return false;
 
-  if (toTile.ownerId && toTile.ownerId !== action.playerId) return;
+  // 1) 타일 소유권 기반 통행 규칙
+  // - 중립(ownerId null): 항상 이동 가능
+  // - 동맹/동일국가: 이동 가능
+  // - 전쟁(war): 적 타일 이동 가능
+  // - 그 외: 이동 불가
+  if (toTile.ownerId && toTile.ownerId !== action.playerId) {
+    const rel = await getRelationFlags(action.gameId!, action.playerId!, toTile.ownerId);
+    if (!rel.friendly && !rel.atWar) return false;
+  }
+
+  // 2) 목적지 타일에 적 유닛이 있으면 '교전 생성' (즉시 전투/점령 확정은 하지 않음)
+  const occupiers = await db
+    .select({ ownerId: units.ownerId })
+    .from(units)
+    .where(and(eq(units.gameId, action.gameId!), eq(units.tileId, toTile.id), isNotNull(units.ownerId), ne(units.ownerId, action.playerId!)));
+
+  const hostileOwners = new Set<number>();
+  for (const row of occupiers) {
+    const oid = row.ownerId;
+    if (!oid) continue;
+    const rel = await getRelationFlags(action.gameId!, action.playerId!, oid);
+    if (!rel.friendly) hostileOwners.add(oid);
+  }
+
+  if (hostileOwners.size > 1) {
+    return false;
+  }
+
+  const engagementDefenderId = hostileOwners.size === 1 ? Array.from(hostileOwners)[0] : null;
+  if (engagementDefenderId != null) {
+    const rel = await getRelationFlags(action.gameId!, action.playerId!, engagementDefenderId);
+    if (!rel.atWar) {
+      return false;
+    }
+  }
 
   // --- GDD 5장: 해군은 항구 있는 도시에서만 바다 진입 ---
   const requested: Record<UnitTypeDB, number> = {
@@ -2492,7 +3172,7 @@ async function processMove(action: TurnAction): Promise<void> {
       // 첩보 병과는 이동 불가 (GDD 11장)
       if (unitType === "spy") continue;
       if (!canMove(unitType, fromTile.terrain, toTile.terrain)) {
-        return; // 이동 불가
+        return false; // 이동 불가
       }
     }
   }
@@ -2522,7 +3202,7 @@ async function processMove(action: TurnAction): Promise<void> {
     
     if (!hasHarbor) {
       // 항구 없이 해군 이동 불가
-      return;
+      return false;
     }
   }
 
@@ -2536,21 +3216,47 @@ async function processMove(action: TurnAction): Promise<void> {
     spy: Math.min(requested.spy, available.spy),
   };
 
-  if (sumTroops(toMove) <= 0) return;
+  const availableMovable: Record<UnitTypeDB, number> = { ...available, spy: 0 };
+  const toMoveMovable: Record<UnitTypeDB, number> = { ...toMove, spy: 0 };
+  const totalAvailable = sumTroops(availableMovable);
+  const totalToMove = sumTroops(toMoveMovable);
+
+  // 병력 이동 단위: 100 고정
+  // 예외: 해당 타일의 가용 병력이 100 미만이면 전량만 이동 허용
+  if (totalAvailable <= 0 || totalToMove <= 0) return false;
+  if (totalAvailable >= 100) {
+    if (totalToMove !== 100) return false;
+  } else {
+    if (totalToMove !== totalAvailable) return false;
+  }
 
   await adjustTileUnits(action.gameId!, data.fromTileId, action.playerId!, toMove, -1);
 
-  if (!toTile.ownerId) {
+  // 교전 중에는 점령/소유권 변경을 유보
+  if (!toTile.ownerId && engagementDefenderId == null) {
     await db.update(hexTiles).set({ ownerId: action.playerId }).where(eq(hexTiles.id, toTile.id));
   }
 
   await adjustTileUnits(action.gameId!, data.toTileId, action.playerId!, toMove, 1);
+
+  if (engagementDefenderId != null) {
+    await upsertEngagement({
+      gameId: action.gameId!,
+      tileId: data.toTileId,
+      attackerId: action.playerId!,
+      defenderId: engagementDefenderId,
+      attackerFromTileId: data.fromTileId,
+      turn: action.turn ?? 1,
+    });
+  }
 
   // --- GDD 4장: 전장의 안개 갱신 (이동한 타일과 주변 타일 시야 확보) ---
   await updateFogOfWar(action.gameId!, action.playerId!, data.toTileId);
 
   await syncTileTroops(action.gameId!, data.fromTileId);
   await syncTileTroops(action.gameId!, data.toTileId);
+
+  return true;
 }
 
 // --- GDD 4장: 전장의 안개(Fog of war) 및 동맹 시야 공유 ---

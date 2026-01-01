@@ -12,6 +12,7 @@ interface PixiHexMapProps {
   playerColor: string;
   currentPlayerId?: number | null;
   focusTileId?: number | null;
+  highlightedTileIds?: number[];
 }
 
 const HEX_SIZE = 32;
@@ -76,10 +77,11 @@ function getHexPoints(cx: number, cy: number): number[] {
   return points;
 }
 
-function draw2_5DHex(graphics: Graphics, cx: number, cy: number, terrain: TerrainType, isSelected: boolean, isOwned: boolean, isExplored: boolean = true) {
+function draw2_5DHex(graphics: Graphics, cx: number, cy: number, terrain: TerrainType, isSelected: boolean, isOwned: boolean, isHighlighted: boolean, isExplored: boolean = true) {
   const colors = TERRAIN_COLORS[terrain];
   const height = TERRAIN_HEIGHT[terrain];
-  const strokeColor = isSelected ? 0xfacc15 : isOwned ? 0x3b82f6 : 0x1e293b;
+  const strokeColor = isSelected ? 0xfacc15 : isHighlighted ? 0xa855f7 : isOwned ? 0x3b82f6 : 0x1e293b;
+  const strokeWidth = isSelected || isHighlighted ? 3 : 1;
 
   const topPoints = getHexPoints(cx, cy - height);
   
@@ -102,7 +104,7 @@ function draw2_5DHex(graphics: Graphics, cx: number, cy: number, terrain: Terrai
   // GDD 4장: 전장의 안개 - 미탐험 타일은 어둡게 표시
   const fillColor = isExplored ? colors.top : 0x1e293b;
   graphics.fill({ color: fillColor });
-  graphics.stroke({ width: 1, color: strokeColor });
+  graphics.stroke({ width: strokeWidth, color: strokeColor });
 }
 
 export function PixiHexMap({
@@ -115,6 +117,7 @@ export function PixiHexMap({
   playerColor,
   currentPlayerId,
   focusTileId,
+  highlightedTileIds = [],
 }: PixiHexMapProps) {
   const containerRef = useRef<HTMLDivElement>(null);
   const appRef = useRef<Application | null>(null);
@@ -265,6 +268,8 @@ export function PixiHexMap({
     let minY = Number.POSITIVE_INFINITY;
     let maxY = Number.NEGATIVE_INFINITY;
 
+    const highlightSet = new Set<number>(highlightedTileIds.filter((x): x is number => typeof x === "number"));
+
     sortedTiles.forEach((tile) => {
       const { x, y } = hexToPixel(tile.q, tile.r);
       minX = Math.min(minX, x - HEX_SIZE);
@@ -278,7 +283,9 @@ export function PixiHexMap({
       const isOwned = tile.ownerId !== null;
       const isExplored = tile.isExplored ?? true;
 
-      draw2_5DHex(hexGraphics, x, y, tile.terrain, isSelected, isOwned, isExplored);
+      const isHighlighted = highlightSet.has(tile.id);
+
+      draw2_5DHex(hexGraphics, x, y, tile.terrain, isSelected, isOwned, isHighlighted, isExplored);
 
       hexGraphics.eventMode = "static";
       hexGraphics.cursor = "pointer";
@@ -351,7 +358,7 @@ export function PixiHexMap({
         const unitColor = isMyUnit ? 0x3b82f6 : 0xef4444;
 
         const troopMarker = new Graphics();
-        troopMarker.roundRect(x - 22, y - 20, 20, 16, 3);
+        troopMarker.roundRect(x - 26, y - 22, 26, 18, 4);
         troopMarker.fill({ color: unitColor, alpha: 0.9 });
         troopMarker.stroke({ width: 1, color: 0xffffff });
         mapContainer.addChild(troopMarker);
@@ -361,8 +368,8 @@ export function PixiHexMap({
           style: new TextStyle({ fontSize: 9, fill: 0xffffff, fontWeight: "bold" }),
         });
         troopText.anchor.set(0.5);
-        troopText.x = x - 12;
-        troopText.y = y - 12;
+        troopText.x = x - 13;
+        troopText.y = y - 13;
         mapContainer.addChild(troopText);
 
         const mainUnit = tileUnits.reduce((max, u) => (u.count || 0) > (max.count || 0) ? u : max, tileUnits[0]);
@@ -373,8 +380,8 @@ export function PixiHexMap({
             style: new TextStyle({ fontSize: 10 }),
           });
           iconText.anchor.set(0.5);
-          iconText.x = x - 12;
-          iconText.y = y - 28;
+          iconText.x = x - 13;
+          iconText.y = y - 32;
           mapContainer.addChild(iconText);
         }
       }
@@ -403,7 +410,7 @@ export function PixiHexMap({
 
     tryFocus();
     clampMapPosition();
-  }, [tiles, cities, units, buildings, selectedTileId, onTileClick, currentPlayerId, focusTileId]);
+  }, [tiles, cities, units, buildings, selectedTileId, onTileClick, currentPlayerId, focusTileId, highlightedTileIds]);
 
   return (
     <div

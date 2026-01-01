@@ -69,6 +69,7 @@ import type {
   SpyLocationType,
   Trade,
   GameNation,
+  AutoMove,
 } from "@shared/schema";
 import { NationsInitialData, SpecialtyStats, CityGradeStats, UnitStats, BuildingStats } from "@shared/schema";
 
@@ -125,6 +126,75 @@ export default function Game() {
   const [recruitCount, setRecruitCount] = useState<number>(100);
 
   const [diplomacy, setDiplomacy] = useState<DiplomacyData[]>([]);
+
+  const [incomingAttacks, setIncomingAttacks] = useState<Array<{ id: number; attackerId: number; targetTileId: number; strategyHint: string | null }>>([]);
+  const loadIncomingAttacks = useCallback(async () => {
+    if (!roomId) return;
+    try {
+      const res = await apiRequest("GET", `/api/rooms/${roomId}/incoming_attacks`);
+      const json = (await res.json()) as { incoming?: Array<{ id: number; attackerId: number; targetTileId: number; strategyHint: string | null }> };
+      setIncomingAttacks(json.incoming ?? []);
+    } catch (e) {
+      console.error("Failed to load incoming attacks:", e);
+    }
+  }, [roomId]);
+
+  const [autoMoves, setAutoMoves] = useState<AutoMove[]>([]);
+  const loadAutoMoves = useCallback(async () => {
+    if (!roomId) return;
+    try {
+      const res = await apiRequest("GET", `/api/rooms/${roomId}/auto_moves`);
+      const json = (await res.json()) as AutoMove[];
+      setAutoMoves(Array.isArray(json) ? json : []);
+    } catch (e) {
+      console.error("Failed to load auto moves:", e);
+    }
+  }, [roomId]);
+
+  const [autoMoveArmed, setAutoMoveArmed] = useState(false);
+  const [autoMoveUnitType, setAutoMoveUnitType] = useState<UnitType>("infantry");
+  const [autoMoveFromTileId, setAutoMoveFromTileId] = useState<number | null>(null);
+  const [autoMoveTargetTileId, setAutoMoveTargetTileId] = useState<number | null>(null);
+
+  const cancelAutoMove = useCallback(async (autoMoveId: number) => {
+    if (!roomId) return;
+    try {
+      await apiRequest("DELETE", `/api/rooms/${roomId}/auto_moves/${autoMoveId}`);
+      await loadAutoMoves();
+      toast({
+        title: "자동이동 취소",
+        description: "자동이동이 취소되었습니다.",
+      });
+    } catch (e: any) {
+      toast({
+        title: "자동이동 취소 실패",
+        description: e?.message || "오류가 발생했습니다.",
+        variant: "destructive",
+      });
+    }
+  }, [roomId, loadAutoMoves, toast]);
+
+  const createAutoMove = useCallback(async (fromTileId: number, targetTileId: number, unitType: UnitType) => {
+    if (!roomId) return;
+    try {
+      await apiRequest("POST", `/api/rooms/${roomId}/auto_moves`, {
+        fromTileId,
+        targetTileId,
+        unitType,
+      });
+      await loadAutoMoves();
+      toast({
+        title: "자동이동 추가",
+        description: `자동이동이 등록되었습니다. (${unitLabels[unitType]} 100)`
+      });
+    } catch (e: any) {
+      toast({
+        title: "자동이동 등록 실패",
+        description: e?.message || "오류가 발생했습니다.",
+        variant: "destructive",
+      });
+    }
+  }, [roomId, loadAutoMoves, toast]);
 
   const loadDiplomacy = useCallback(async () => {
     if (!roomId) return;
@@ -450,7 +520,18 @@ export default function Game() {
     // 탭 배지 갱신 (거래 패널 외부에서 제안이 들어오는 경우 대비)
     await loadDiplomacy();
     await loadPendingTradeCount();
-  }, [roomId, loadDiplomacy, loadPendingTradeCount]);
+    await loadIncomingAttacks();
+    await loadAutoMoves();
+  }, [roomId, loadDiplomacy, loadPendingTradeCount, loadIncomingAttacks, loadAutoMoves]);
+
+  useEffect(() => {
+    if (!roomId || !currentPlayer) return;
+    const id = window.setInterval(() => {
+      loadIncomingAttacks();
+      loadAutoMoves();
+    }, 4000);
+    return () => window.clearInterval(id);
+  }, [roomId, currentPlayer, loadIncomingAttacks, loadAutoMoves]);
 
   const getTroopsForTile = useCallback((tileId: number, ownerId: number | null): TroopData => {
     const base: TroopData = { infantry: 0, cavalry: 0, archer: 0, siege: 0, navy: 0, spy: 0 };
@@ -681,12 +762,20 @@ export default function Game() {
   }, [turnEndTime, turnDuration]);
 
   const handleTileClick = useCallback((tileId: number) => {
+    if (autoMoveArmed && autoMoveFromTileId != null) {
+      if (tileId !== autoMoveFromTileId) {
+        setAutoMoveTargetTileId(tileId);
+        createAutoMove(autoMoveFromTileId, tileId, autoMoveUnitType);
+        setAutoMoveArmed(false);
+        return;
+      }
+    }
     if ((moveOpen || attackOpen) && actionFromTileId !== null && tileId !== actionFromTileId) {
       setActionTargetTileId(tileId);
       return;
     }
     setSelectedTileId(tileId);
-  }, [moveOpen, attackOpen, actionFromTileId]);
+  }, [autoMoveArmed, autoMoveFromTileId, autoMoveUnitType, createAutoMove, moveOpen, attackOpen, actionFromTileId]);
 
   const handleSendMessage = useCallback((content: string, channel: ChatMessage["channel"], targetId?: string | null) => {
     const rid = roomId;
@@ -974,7 +1063,7 @@ export default function Game() {
 
       <div className="flex-1 flex overflow-hidden">
         <div className="w-80 border-r bg-sidebar flex flex-col shrink-0">
-          <Tabs value={activeTab} onValueChange={setActiveTab} className="flex-1 flex flex-col">
+          <Tabs value={activeTab} onValueChange={setActiveTab} className="flex-1 flex flex-col min-h-0">
             <TabsList className="w-full justify-start rounded-none border-b bg-transparent p-0 shrink-0">
               <TabsTrigger
                 value="map"
@@ -988,7 +1077,14 @@ export default function Game() {
                 className="flex-1 rounded-none border-b-2 border-transparent data-[state=active]:border-primary"
                 data-testid="tab-city"
               >
-                <Building2 className="w-4 h-4" />
+                <div className="relative">
+                  <Building2 className="w-4 h-4" />
+                  {incomingAttacks.length > 0 && (
+                    <Badge className="absolute -top-2 -right-2 h-4 min-w-4 px-1 flex items-center justify-center text-[10px] leading-none" variant="destructive">
+                      {incomingAttacks.length}
+                    </Badge>
+                  )}
+                </div>
               </TabsTrigger>
               <TabsTrigger
                 value="diplomacy"
@@ -1041,11 +1137,23 @@ export default function Game() {
               </TabsTrigger>
             </TabsList>
 
-            <div className="flex-1 overflow-hidden">
+            <div className="flex-1 overflow-hidden min-h-0">
               <TabsContent value="map" className="h-full m-0 p-0">
                 <NewsFeed news={news} />
               </TabsContent>
               <TabsContent value="city" className="h-full m-0 p-4">
+                {(() => {
+                  const selectedCityCenterTileId = selectedCity?.centerTileId ?? null;
+                  const inc =
+                    selectedCityCenterTileId != null
+                      ? incomingAttacks.find((a) => a.targetTileId === selectedCityCenterTileId) ?? null
+                      : null;
+                  const attackerName =
+                    inc?.attackerId != null
+                      ? (players.find((p) => p.id === inc.attackerId)?.nationId ?? `Player ${inc.attackerId}`)
+                      : "-";
+
+                  return (
                 <CityPanel
                   city={selectedCity}
                   troops={selectedCityTroops}
@@ -1056,10 +1164,13 @@ export default function Game() {
                   onSubmitDefenseStrategy={(cityId, strategy) => {
                     submitTurnAction("defense", { cityId, strategy });
                   }}
+                  incomingAttack={inc ? { attackerName, strategyHint: inc.strategyHint } : null}
                   onSubmitCivilWar={(payload) => {
                     submitTurnAction("civil_war", payload);
                   }}
                 />
+                  );
+                })()}
               </TabsContent>
               <TabsContent value="diplomacy" className="h-full m-0 p-4">
                 <DiplomacyPanel
@@ -1114,14 +1225,18 @@ export default function Game() {
                   currentPlayerId={String(currentUser?.id ?? "")} 
                 />
               </TabsContent>
-              <TabsContent value="trade" className="h-full m-0 p-4">
-                <TradePanel
-                  roomId={roomId ?? 0}
-                  currentPlayerId={currentPlayer?.id ?? 0}
-                  players={players}
-                  myGold={currentPlayer?.gold ?? 0}
-                  myFood={currentPlayer?.food ?? 0}
-                />
+              <TabsContent value="trade" className="h-full m-0 p-4 min-h-0">
+                {roomId && currentPlayer?.id ? (
+                  <TradePanel
+                    roomId={roomId}
+                    currentPlayerId={currentPlayer.id}
+                    players={players}
+                    myGold={currentPlayer.gold ?? 0}
+                    myFood={currentPlayer.food ?? 0}
+                  />
+                ) : (
+                  <div className="text-muted-foreground">거래를 사용하려면 플레이어가 필요합니다.</div>
+                )}
               </TabsContent>
             </div>
           </Tabs>
@@ -1139,6 +1254,7 @@ export default function Game() {
               playerColor={playerColor}
               currentPlayerId={currentPlayer?.id}
               focusTileId={focusTileId}
+              highlightedTileIds={[autoMoveFromTileId, autoMoveTargetTileId].filter((x): x is number => typeof x === "number")}
             />
 
             <div className="absolute left-4 top-4 w-80 bg-card/95 backdrop-blur border rounded-md p-3 space-y-2">
@@ -1196,6 +1312,83 @@ export default function Game() {
                       </div>
                     </>
                   )}
+
+                  <div className="border-t pt-2 space-y-2">
+                    <div className="flex items-center justify-between">
+                      <div className="text-sm font-medium">자동이동</div>
+                      <Badge variant={autoMoveArmed ? "destructive" : "outline"} className="text-xs">
+                        {autoMoveArmed ? "대기중" : "꺼짐"}
+                      </Badge>
+                    </div>
+
+                    <div className="grid grid-cols-2 gap-2">
+                      <Select value={autoMoveUnitType} onValueChange={(v) => setAutoMoveUnitType(v as UnitType)}>
+                        <SelectTrigger>
+                          <SelectValue placeholder="병과" />
+                        </SelectTrigger>
+                        <SelectContent>
+                          {(Object.keys(unitLabels) as UnitType[]).map((ut) => (
+                            <SelectItem key={ut} value={ut}>
+                              {unitLabels[ut]}
+                            </SelectItem>
+                          ))}
+                        </SelectContent>
+                      </Select>
+                      <Button
+                        size="sm"
+                        variant={autoMoveArmed ? "destructive" : "secondary"}
+                        disabled={!selectedTile || (selectedTileTroops[autoMoveUnitType] ?? 0) <= 0}
+                        onClick={() => {
+                          if (!selectedTile) return;
+                          if (autoMoveArmed) {
+                            setAutoMoveArmed(false);
+                            return;
+                          }
+                          setAutoMoveFromTileId(selectedTile.id);
+                          setAutoMoveTargetTileId(null);
+                          setAutoMoveArmed(true);
+                        }}
+                      >
+                        {autoMoveArmed ? "취소" : "출발 선택"}
+                      </Button>
+                    </div>
+
+                    {autoMoveArmed && autoMoveFromTileId != null ? (
+                      <div className="text-xs text-muted-foreground">
+                        출발: {autoMoveFromTileId} / 목표 타일을 클릭하면 자동이동이 추가됩니다.
+                      </div>
+                    ) : null}
+
+                    {autoMoves.length > 0 ? (
+                      <div className="space-y-1 max-h-40 overflow-y-auto">
+                        {autoMoves
+                          .slice()
+                          .sort((a, b) => (b.id ?? 0) - (a.id ?? 0))
+                          .map((m) => (
+                            <div key={m.id} className="text-xs bg-muted/50 rounded p-2 space-y-1">
+                              <div className="flex items-center justify-between">
+                                <div className="font-medium">
+                                  #{m.id} {unitLabels[m.unitType as UnitType] ?? String(m.unitType)} {m.amount ?? 100}
+                                </div>
+                                <Badge variant={m.status === "active" ? "secondary" : m.status === "completed" ? "outline" : "destructive"} className="text-[10px]">
+                                  {m.status}
+                                </Badge>
+                              </div>
+                              <div className="text-muted-foreground">
+                                {m.currentTileId} → {m.targetTileId} (step {m.pathIndex ?? 0}/{Array.isArray(m.path) ? (m.path as any[]).length - 1 : 0})
+                              </div>
+                              {m.status === "active" ? (
+                                <Button size="sm" variant="outline" className="w-full" onClick={() => cancelAutoMove(m.id)}>
+                                  취소
+                                </Button>
+                              ) : null}
+                            </div>
+                          ))}
+                      </div>
+                    ) : (
+                      <div className="text-xs text-muted-foreground">등록된 자동이동이 없습니다.</div>
+                    )}
+                  </div>
                 </>
               )}
             </div>

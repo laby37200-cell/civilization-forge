@@ -316,6 +316,7 @@ export const spies = pgTable("spies", {
   detectionChance: integer("detection_chance").default(20), // 발각 확률 %
   isAlive: boolean("is_alive").default(true),
   createdTurn: integer("created_turn").notNull(),
+  deployedTurn: integer("deployed_turn"),
   lastActiveTurn: integer("last_active_turn"),
 });
 
@@ -331,6 +332,61 @@ export const aiMemory = pgTable("ai_memory", {
 });
 
 export type AIMemory = typeof aiMemory.$inferSelect;
+
+// === AUTO MOVE ORDERS (multi-turn path movement) ===
+export type AutoMoveStatusDB = "active" | "completed" | "canceled";
+
+export const autoMoves = pgTable("auto_moves", {
+  id: serial("id").primaryKey(),
+  gameId: integer("game_id").references(() => gameRooms.id),
+  playerId: integer("player_id").references(() => gamePlayers.id),
+  unitType: text("unit_type").notNull().$type<UnitTypeDB>(),
+  amount: integer("amount").notNull().default(100),
+  currentTileId: integer("current_tile_id").notNull().references(() => hexTiles.id),
+  targetTileId: integer("target_tile_id").notNull().references(() => hexTiles.id),
+  path: jsonb("path").$type<number[]>().default([]),
+  pathIndex: integer("path_index").notNull().default(0),
+  status: text("status").notNull().$type<AutoMoveStatusDB>().default("active"),
+  cancelReason: text("cancel_reason"),
+  createdTurn: integer("created_turn").notNull().default(0),
+  updatedTurn: integer("updated_turn").notNull().default(0),
+  createdAt: timestamp("created_at").defaultNow(),
+});
+
+export type AutoMove = typeof autoMoves.$inferSelect;
+
+export type EngagementStateDB = "engaged" | "attacker_retreating" | "defender_retreating" | "resolved";
+
+export const engagements = pgTable("engagements", {
+  id: serial("id").primaryKey(),
+  gameId: integer("game_id").references(() => gameRooms.id),
+  tileId: integer("tile_id").references(() => hexTiles.id),
+  attackerId: integer("attacker_id").references(() => gamePlayers.id),
+  defenderId: integer("defender_id").references(() => gamePlayers.id),
+  attackerFromTileId: integer("attacker_from_tile_id").references(() => hexTiles.id),
+  startedTurn: integer("started_turn").notNull(),
+  lastResolvedTurn: integer("last_resolved_turn").default(0),
+  state: text("state").notNull().$type<EngagementStateDB>().default("engaged"),
+  createdAt: timestamp("created_at").defaultNow(),
+});
+
+export type Engagement = typeof engagements.$inferSelect;
+
+export type EngagementActionTypeDB = "continue" | "retreat";
+
+export const engagementActions = pgTable("engagement_actions", {
+  id: serial("id").primaryKey(),
+  gameId: integer("game_id").references(() => gameRooms.id),
+  engagementId: integer("engagement_id").references(() => engagements.id),
+  playerId: integer("player_id").references(() => gamePlayers.id),
+  turn: integer("turn").notNull(),
+  actionType: text("action_type").notNull().$type<EngagementActionTypeDB>(),
+  data: jsonb("data"),
+  resolved: boolean("resolved").default(false),
+  createdAt: timestamp("created_at").defaultNow(),
+});
+
+export type EngagementAction = typeof engagementActions.$inferSelect;
 
 // === 뉴스 피드 NEWS ===
 export type NewsCategoryDB = "battle" | "diplomacy" | "economy" | "event" | "espionage" | "city";

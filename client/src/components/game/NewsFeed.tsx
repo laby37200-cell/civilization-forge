@@ -80,12 +80,12 @@ function NewsItemCard({ item }: { item: NewsItem }) {
 
 export function NewsFeed({ news }: NewsFeedProps) {
   return (
-    <div className="h-full flex flex-col" data-testid="news-feed">
+    <div className="h-full flex flex-col min-h-0" data-testid="news-feed">
       <div className="flex items-center justify-between px-4 py-2 border-b">
         <h3 className="font-medium">뉴스</h3>
         <Badge variant="secondary">{news.length}</Badge>
       </div>
-      <ScrollArea className="flex-1">
+      <ScrollArea className="flex-1 min-h-0">
         <div className="p-2 space-y-2">
           {news.length === 0 ? (
             <div className="text-center text-muted-foreground py-8">
