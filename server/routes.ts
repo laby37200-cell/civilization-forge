@@ -35,7 +35,9 @@ import {
   users,
   chatMessages,
   type ChatChannelDB,
-  insertUserSchema
+  insertUserSchema,
+  NationsInitialData,
+  type AIDifficulty
 } from "@shared/schema";
 import { eq, and, sql, gt, lt, or, ne, inArray, isNotNull } from "drizzle-orm";
 import { generateNewsNarrative, judgeBattle } from "./llm";
@@ -43,7 +45,6 @@ import { getNeighbors } from "./turnResolution";
 import { loadAppendixA_Cities } from "./gddLoader";
 import { deploySpy, proposeTrade, respondTrade } from "./turnResolution";
 import { hash, compare } from "bcrypt";
-import { NationsInitialData, type AIDifficulty } from "./gddLoader";
 
 // Share existing vision between new allies
 async function shareAllianceVision(gameId: number, player1Id: number, player2Id: number) {
@@ -191,6 +192,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
       return res.status(401).json({ error: "Not authenticated" });
     }
 
+    let createdRoomId: number | null = null;
     try {
       const [room] = await db.insert(gameRooms).values({
         name: req.body.name || "새로운 게임",
@@ -203,10 +205,42 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
         aiDifficulty: req.body.aiDifficulty || "normal",
       }).returning();
 
+      createdRoomId = room.id;
+
       await seedRoom(room.id);
 
-      res.json(room);
+      // 호스트를 자동으로 플레이어로 추가
+      const [hostPlayer] = await db.insert(gamePlayers).values({
+        gameId: room.id,
+        oderId: oderId,
+        color: "#3b82f6",
+      }).returning();
+
+      res.json({ ...room, playerId: hostPlayer.id });
     } catch (error) {
+      console.error("[Room Create Error]", error);
+      try {
+        const rid = createdRoomId;
+        if (!rid) throw new Error("cleanup skipped: no createdRoomId");
+
+        await db.delete(battles).where(eq(battles.gameId, rid));
+        await db.delete(news).where(eq(news.gameId, rid));
+        await db.delete(chatMessages).where(eq(chatMessages.gameId, rid));
+        await db.delete(aiMemory).where(eq(aiMemory.gameId, rid));
+        await db.delete(trades).where(eq(trades.gameId, rid));
+        await db.delete(diplomacy).where(eq(diplomacy.gameId, rid));
+        await db.delete(spies).where(eq(spies.gameId, rid));
+        await db.delete(buildings).where(eq(buildings.gameId, rid));
+        await db.delete(units).where(eq(units.gameId, rid));
+        await db.delete(turnActions).where(eq(turnActions.gameId, rid));
+        await db.delete(specialties).where(eq(specialties.gameId, rid));
+        await db.delete(cities).where(eq(cities.gameId, rid));
+        await db.delete(hexTiles).where(eq(hexTiles.gameId, rid));
+        await db.delete(gamePlayers).where(eq(gamePlayers.gameId, rid));
+        await db.delete(gameRooms).where(eq(gameRooms.id, rid));
+      } catch (cleanupError) {
+        console.error("[Room Create Cleanup Error]", cleanupError);
+      }
       res.status(500).json({ error: "Failed to create room" });
     }
   });
@@ -374,6 +408,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
     const roomId = parseInt(req.params.id);
     
     try {
+      await seedRoom(roomId);
       const [existing] = await db
         .select()
         .from(gamePlayers)
@@ -830,25 +865,77 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
   });
 
   async function seedRoom(roomId: number) {
-    const [existing] = await db
-      .select({ count: sql<number>`count(*)`.mapWith(Number) })
-      .from(hexTiles)
-      .where(eq(hexTiles.gameId, roomId));
+    try {
+      console.log(`[seedRoom] Starting room initialization for roomId: ${roomId}`);
+      
+      const [existing] = await db
+        .select({ count: sql<number>`count(*)`.mapWith(Number) })
+        .from(hexTiles)
+        .where(eq(hexTiles.gameId, roomId));
 
-    if ((existing?.count ?? 0) > 0) return;
+      if ((existing?.count ?? 0) > 0) {
+        console.log(`[seedRoom] Room ${roomId} already initialized, skipping`);
+        return;
+      }
 
-    const [room] = await db
-      .select({
-        aiPlayerCount: gameRooms.aiPlayerCount,
-        aiDifficulty: gameRooms.aiDifficulty,
-        mapWidth: gameRooms.mapWidth,
-        mapHeight: gameRooms.mapHeight,
-      })
-      .from(gameRooms)
-      .where(eq(gameRooms.id, roomId));
+      const [room] = await db
+        .select({
+          aiPlayerCount: gameRooms.aiPlayerCount,
+          aiDifficulty: gameRooms.aiDifficulty,
+          mapWidth: gameRooms.mapWidth,
+          mapHeight: gameRooms.mapHeight,
+        })
+        .from(gameRooms)
+        .where(eq(gameRooms.id, roomId));
 
-    const mapWidth = room?.mapWidth ?? 60;
-    const mapHeight = room?.mapHeight ?? 30;
+      if (!room) {
+        throw new Error(`Room ${roomId} not found`);
+      }
+
+      console.log(`[seedRoom] Room config:`, room);
+
+      const mapWidth = room?.mapWidth ?? 60;
+      const mapHeight = room?.mapHeight ?? 30;
+
+    // 세계지도 기반 지형 생성 함수
+    const getWorldMapTerrain = (q: number, r: number, width: number, height: number): "plains" | "grassland" | "mountain" | "hill" | "forest" | "deep_forest" | "desert" | "sea" => {
+      // 정규화된 좌표 (0~1)
+      const nx = (q + Math.floor(r / 2)) / width;
+      const ny = r / height;
+      
+      // 바다 영역 (지도 가장자리 + 태평양/대서양 위치)
+      if (nx < 0.05 || nx > 0.95 || ny < 0.05 || ny > 0.95) return "sea";
+      if (nx > 0.15 && nx < 0.25 && ny > 0.3 && ny < 0.7) return "sea"; // 대서양
+      if (nx > 0.75 && nx < 0.85 && ny > 0.2 && ny < 0.8) return "sea"; // 태평양
+      
+      // 사막 영역 (북아프리카/중동/호주)
+      if (ny > 0.35 && ny < 0.55) {
+        if (nx > 0.35 && nx < 0.55) return "desert"; // 사하라/중동
+      }
+      if (ny > 0.7 && nx > 0.7 && nx < 0.85) return "desert"; // 호주
+      
+      // 산맥 영역 (히말라야/알프스/안데스/로키)
+      if (nx > 0.55 && nx < 0.65 && ny > 0.25 && ny < 0.45) return "mountain"; // 히말라야
+      if (nx > 0.38 && nx < 0.45 && ny > 0.2 && ny < 0.35) return "mountain"; // 알프스
+      if (nx > 0.12 && nx < 0.18 && ny > 0.4 && ny < 0.75) return "mountain"; // 안데스
+      if (nx > 0.08 && nx < 0.15 && ny > 0.15 && ny < 0.35) return "mountain"; // 로키
+      
+      // 숲 영역 (시베리아/아마존/동남아)
+      if (ny < 0.25 && nx > 0.45 && nx < 0.75) return "deep_forest"; // 시베리아
+      if (nx > 0.15 && nx < 0.25 && ny > 0.45 && ny < 0.65) return "deep_forest"; // 아마존
+      if (nx > 0.65 && nx < 0.8 && ny > 0.45 && ny < 0.6) return "forest"; // 동남아
+      
+      // 구릉 지대 (유럽/동아시아)
+      if (nx > 0.35 && nx < 0.5 && ny > 0.15 && ny < 0.35) return "hill";
+      if (nx > 0.6 && nx < 0.75 && ny > 0.2 && ny < 0.4) return "hill";
+      
+      // 초원 (북미 중부/유라시아 스텝)
+      if (nx > 0.08 && nx < 0.2 && ny > 0.2 && ny < 0.4) return "grassland";
+      if (nx > 0.45 && nx < 0.6 && ny > 0.25 && ny < 0.4) return "grassland";
+      
+      // 기본 평야
+      return "plains";
+    };
 
     const coords: Array<{ q: number; r: number }> = [];
     for (let r = 0; r < mapHeight; r++) {
@@ -863,11 +950,12 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
         gameId: roomId,
         q,
         r,
-        terrain: "plains" as const,
+        terrain: getWorldMapTerrain(q, r, mapWidth, mapHeight),
         ownerId: null,
         cityId: null,
         troops: 0,
         isExplored: false,
+        fogOfWar: [],
       }))
     );
 
@@ -988,8 +1076,74 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
       }));
 
       if (aiPlayerRows.length > 0) {
-        await db.insert(gamePlayers).values(aiPlayerRows);
+        const insertedAI = await db.insert(gamePlayers).values(aiPlayerRows).returning();
+        
+        // AI 플레이어에게 해당 국가의 수도만 할당 (나머지 도시는 인간 플레이어용)
+        for (const aiPlayer of insertedAI) {
+          if (!aiPlayer.nationId) continue;
+          
+          // 해당 국가의 수도만 찾기 (capital 등급)
+          const [capitalCity] = await db
+            .select()
+            .from(cities)
+            .where(and(
+              eq(cities.gameId, roomId), 
+              eq(cities.nationId, aiPlayer.nationId),
+              eq(cities.grade, "capital")
+            ));
+          
+          if (!capitalCity) continue;
+          
+          // 수도 소유권만 할당
+          await db.update(cities).set({ ownerId: aiPlayer.id }).where(eq(cities.id, capitalCity.id));
+          
+          // 도시 클러스터 타일 소유권 할당
+          if (capitalCity.centerTileId) {
+            const [centerTile] = await db.select().from(hexTiles).where(eq(hexTiles.id, capitalCity.centerTileId));
+            if (centerTile) {
+              // 중앙 타일 + 주변 6타일 소유권 설정
+              const clusterTiles = await db
+                .select()
+                .from(hexTiles)
+                .where(and(eq(hexTiles.gameId, roomId), eq(hexTiles.cityId, capitalCity.id)));
+              
+              for (const tile of clusterTiles) {
+                await db.update(hexTiles).set({ ownerId: aiPlayer.id }).where(eq(hexTiles.id, tile.id));
+                
+                // 시야 설정 (fogOfWar)
+                const existingFog = Array.isArray(tile.fogOfWar) ? tile.fogOfWar as number[] : [];
+                if (!existingFog.includes(aiPlayer.id)) {
+                  await db.update(hexTiles)
+                    .set({ fogOfWar: [...existingFog, aiPlayer.id] })
+                    .where(eq(hexTiles.id, tile.id));
+                }
+              }
+              
+              // 초기 병력 배치
+              const initialTroops = 500; // 수도는 500
+              await db.insert(units).values({
+                gameId: roomId,
+                tileId: capitalCity.centerTileId,
+                cityId: capitalCity.id,
+                ownerId: aiPlayer.id,
+                unitType: "infantry",
+                count: initialTroops,
+              });
+              
+              // 타일 병력 수 동기화
+              await db.update(hexTiles)
+                .set({ troops: initialTroops })
+                .where(eq(hexTiles.id, capitalCity.centerTileId));
+            }
+          }
+        }
       }
+    }
+    
+    console.log(`[seedRoom] Room ${roomId} initialization completed successfully`);
+    } catch (error) {
+      console.error(`[seedRoom] Error initializing room ${roomId}:`, error);
+      throw error;
     }
   }
 

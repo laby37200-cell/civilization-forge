@@ -1,13 +1,16 @@
 import { useEffect, useRef, useCallback, useState } from "react";
 import { Application, Graphics, Container, Text, TextStyle } from "pixi.js";
-import type { HexTile, TerrainType, City } from "@shared/schema";
+import type { HexTile, TerrainType, City, Unit, Building } from "@shared/schema";
 
 interface PixiHexMapProps {
   tiles: HexTile[];
   cities: City[];
+  units?: Unit[];
+  buildings?: Building[];
   selectedTileId: number | null;
   onTileClick: (tileId: number) => void;
   playerColor: string;
+  currentPlayerId?: number | null;
 }
 
 const HEX_SIZE = 32;
@@ -35,6 +38,24 @@ const TERRAIN_HEIGHT: Record<TerrainType, number> = {
   deep_forest: 10,
   desert: 2,
   sea: 0,
+};
+
+// 도시 등급별 색상 및 크기
+const CITY_GRADE_STYLE: Record<string, { color: number; size: number; icon: string }> = {
+  capital: { color: 0xfbbf24, size: 16, icon: "★" },
+  major: { color: 0x60a5fa, size: 14, icon: "◆" },
+  normal: { color: 0x9ca3af, size: 12, icon: "●" },
+  town: { color: 0x6b7280, size: 10, icon: "○" },
+};
+
+// 유닛 타입별 아이콘
+const UNIT_ICONS: Record<string, string> = {
+  infantry: "⚔",
+  cavalry: "🐎",
+  archer: "🏹",
+  siege: "💣",
+  navy: "⚓",
+  spy: "👁",
 };
 
 function hexToPixel(q: number, r: number): { x: number; y: number } {
@@ -86,9 +107,12 @@ function draw2_5DHex(graphics: Graphics, cx: number, cy: number, terrain: Terrai
 export function PixiHexMap({
   tiles,
   cities,
+  units = [],
+  buildings = [],
   selectedTileId,
   onTileClick,
   playerColor,
+  currentPlayerId,
 }: PixiHexMapProps) {
   const containerRef = useRef<HTMLDivElement>(null);
   const appRef = useRef<Application | null>(null);
@@ -169,39 +193,99 @@ export function PixiHexMap({
 
         const city = cities.find((c) => c.centerTileId === tile.id);
         if (city) {
+          const gradeStyle = CITY_GRADE_STYLE[city.grade] || CITY_GRADE_STYLE.normal;
+          const isMyCity = city.ownerId === currentPlayerId;
+          const ownerColor = isMyCity ? 0x22c55e : (city.ownerId ? 0xef4444 : 0x6b7280);
+          
+          // 도시 배경 원
           const cityMarker = new Graphics();
-          cityMarker.circle(x, y, 12);
-          cityMarker.fill({ color: 0x1e293b });
-          cityMarker.stroke({ width: 2, color: 0x475569 });
+          cityMarker.circle(x, y - 5, gradeStyle.size);
+          cityMarker.fill({ color: ownerColor, alpha: 0.8 });
+          cityMarker.stroke({ width: 2, color: gradeStyle.color });
           mapContainer.addChild(cityMarker);
 
-          const textStyle = new TextStyle({
-            fontSize: 10,
+          // 도시 등급 아이콘
+          const iconStyle = new TextStyle({
+            fontSize: gradeStyle.size - 2,
             fill: 0xffffff,
             fontWeight: "bold",
           });
-          const cityLabel = new Text({ text: city.nameKo.slice(0, 2), style: textStyle });
-          cityLabel.anchor.set(0.5);
+          const cityIcon = new Text({ text: gradeStyle.icon, style: iconStyle });
+          cityIcon.anchor.set(0.5);
+          cityIcon.x = x;
+          cityIcon.y = y - 5;
+          mapContainer.addChild(cityIcon);
+
+          // 도시 이름 (아래에 표시)
+          const nameStyle = new TextStyle({
+            fontSize: 9,
+            fill: 0xffffff,
+            fontWeight: "bold",
+            stroke: { color: 0x000000, width: 2 },
+          });
+          const cityLabel = new Text({ text: city.nameKo, style: nameStyle });
+          cityLabel.anchor.set(0.5, 0);
           cityLabel.x = x;
-          cityLabel.y = y;
+          cityLabel.y = y + gradeStyle.size;
           mapContainer.addChild(cityLabel);
+          
+          // 건물 수 표시
+          const cityBuildings = buildings.filter(b => b.cityId === city.id);
+          if (cityBuildings.length > 0) {
+            const buildingMarker = new Graphics();
+            buildingMarker.rect(x + 12, y - 18, 14, 14);
+            buildingMarker.fill({ color: 0x8b5cf6, alpha: 0.9 });
+            mapContainer.addChild(buildingMarker);
+            
+            const buildingText = new Text({
+              text: `🏛${cityBuildings.length}`,
+              style: new TextStyle({ fontSize: 8, fill: 0xffffff }),
+            });
+            buildingText.anchor.set(0.5);
+            buildingText.x = x + 19;
+            buildingText.y = y - 11;
+            mapContainer.addChild(buildingText);
+          }
         }
 
-        const troops = tile.troops ?? 0;
-        if (troops > 0) {
+        // 유닛 표시 (타일별 유닛 집계)
+        const tileUnits = units.filter(u => u.tileId === tile.id);
+        const totalTroops = tileUnits.reduce((sum, u) => sum + (u.count || 0), 0);
+        
+        if (totalTroops > 0) {
+          const isMyUnit = tileUnits.some(u => u.ownerId === currentPlayerId);
+          const unitColor = isMyUnit ? 0x3b82f6 : 0xef4444;
+          
+          // 유닛 마커 배경
           const troopMarker = new Graphics();
-          troopMarker.circle(x - 15, y - 15, 8);
-          troopMarker.fill({ color: 0x3b82f6 });
+          troopMarker.roundRect(x - 22, y - 20, 20, 16, 3);
+          troopMarker.fill({ color: unitColor, alpha: 0.9 });
+          troopMarker.stroke({ width: 1, color: 0xffffff });
           mapContainer.addChild(troopMarker);
 
+          // 유닛 수
           const troopText = new Text({
-            text: troops > 999 ? `${Math.floor(troops / 1000)}k` : troops.toString(),
-            style: new TextStyle({ fontSize: 8, fill: 0xffffff }),
+            text: totalTroops > 999 ? `${Math.floor(totalTroops / 1000)}k` : totalTroops.toString(),
+            style: new TextStyle({ fontSize: 9, fill: 0xffffff, fontWeight: "bold" }),
           });
           troopText.anchor.set(0.5);
-          troopText.x = x - 15;
-          troopText.y = y - 15;
+          troopText.x = x - 12;
+          troopText.y = y - 12;
           mapContainer.addChild(troopText);
+          
+          // 주요 유닛 타입 아이콘
+          const mainUnit = tileUnits.reduce((max, u) => (u.count || 0) > (max.count || 0) ? u : max, tileUnits[0]);
+          if (mainUnit) {
+            const unitIcon = UNIT_ICONS[mainUnit.unitType] || "⚔";
+            const iconText = new Text({
+              text: unitIcon,
+              style: new TextStyle({ fontSize: 10 }),
+            });
+            iconText.anchor.set(0.5);
+            iconText.x = x - 12;
+            iconText.y = y - 28;
+            mapContainer.addChild(iconText);
+          }
         }
       });
 
@@ -216,7 +300,7 @@ export function PixiHexMap({
         appRef.current = null;
       }
     };
-  }, [tiles, cities, selectedTileId, onTileClick]);
+  }, [tiles, cities, units, buildings, selectedTileId, onTileClick, currentPlayerId]);
 
   return (
     <div

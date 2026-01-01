@@ -422,8 +422,60 @@ export default function Lobby() {
     }
   };
 
-  const handleQuickMatch = () => {
-    setLocation("/game/quick");
+  const handleQuickMatch = async () => {
+    try {
+      // 빠른 대전 방 자동 생성
+      const res = await apiRequest("POST", "/api/rooms", {
+        name: "빠른 대전",
+        maxPlayers: 8,
+        turnDuration: 30,
+        victoryCondition: "domination",
+        mapMode: "continents",
+        aiPlayerCount: 3,
+        aiDifficulty: "normal",
+      });
+      const room = (await res.json()) as { id: number };
+      await roomsQuery.refetch();
+      setLocation(`/game/${room.id}`);
+    } catch (e: any) {
+      if (String(e?.message || "").startsWith("401")) {
+        setLocation("/auth");
+        return;
+      }
+      toast({
+        title: "빠른 대전 실패",
+        description: e?.message || "요청 처리 중 오류가 발생했습니다.",
+        variant: "destructive",
+      });
+    }
+  };
+
+  const handleCreateTestRoom = async () => {
+    try {
+      // AI끼리만 플레이하는 테스트 방 생성
+      const res = await apiRequest("POST", "/api/rooms", {
+        name: "AI 테스트 방 (관전용)",
+        maxPlayers: 8,
+        turnDuration: 15,
+        victoryCondition: "domination",
+        mapMode: "continents",
+        aiPlayerCount: 8, // AI만 8명
+        aiDifficulty: "hard",
+      });
+      const room = (await res.json()) as { id: number };
+      await roomsQuery.refetch();
+      setLocation(`/game/${room.id}`);
+    } catch (e: any) {
+      if (String(e?.message || "").startsWith("401")) {
+        setLocation("/auth");
+        return;
+      }
+      toast({
+        title: "테스트 방 생성 실패",
+        description: e?.message || "요청 처리 중 오류가 발생했습니다.",
+        variant: "destructive",
+      });
+    }
   };
 
   return (
@@ -444,6 +496,10 @@ export default function Lobby() {
             <Button variant="outline" size="lg" onClick={handleQuickMatch} data-testid="button-quick-match">
               <Swords className="w-5 h-5 mr-2" />
               빠른 대전
+            </Button>
+            <Button variant="outline" size="lg" onClick={handleCreateTestRoom} data-testid="button-test-room">
+              <Bot className="w-5 h-5 mr-2" />
+              AI 테스트 방
             </Button>
             <CreateRoomDialog onCreateRoom={handleCreateRoom} />
           </div>

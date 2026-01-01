@@ -180,6 +180,12 @@ export default function Game() {
     }
   }, [roomId]);
 
+  const handleLeaveRoom = useCallback(() => {
+    if (window.confirm("정말 방을 나가시겠습니까?")) {
+      setLocation("/");
+    }
+  }, [setLocation]);
+
   const handleDiplomacyAction = useCallback(async (targetPlayerId: number, action: string) => {
     if (!roomId) return;
     try {
@@ -445,8 +451,13 @@ export default function Game() {
   }, [nationCapacity]);
 
   const availableCities = useMemo(() => {
-    if (!currentPlayer?.nationId) return [];
-    return cities.filter((c) => !c.ownerId && c.nationId === currentPlayer.nationId);
+    if (!currentPlayer?.nationId) {
+      console.log("[availableCities] No nationId selected");
+      return [];
+    }
+    const filtered = cities.filter((c) => !c.ownerId && c.nationId === currentPlayer.nationId);
+    console.log("[availableCities] nationId:", currentPlayer.nationId, "cities:", filtered.length);
+    return filtered;
   }, [cities, currentPlayer]);
 
   useEffect(() => {
@@ -913,7 +924,7 @@ export default function Game() {
           <Button variant="ghost" size="icon" data-testid="button-settings">
             <Settings className="w-5 h-5" />
           </Button>
-          <Button variant="ghost" size="icon" data-testid="button-exit">
+          <Button variant="ghost" size="icon" data-testid="button-exit" onClick={handleLeaveRoom}>
             <LogOut className="w-5 h-5" />
           </Button>
         </div>
@@ -1035,9 +1046,12 @@ export default function Game() {
             <PixiHexMap
               tiles={tiles}
               cities={cities}
+              units={units}
+              buildings={buildings}
               selectedTileId={selectedTileId}
               onTileClick={handleTileClick}
               playerColor={playerColor}
+              currentPlayerId={currentPlayer?.id}
             />
 
             <div className="absolute left-4 top-4 w-80 bg-card/95 backdrop-blur border rounded-md p-3 space-y-2">

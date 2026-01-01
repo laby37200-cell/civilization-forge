@@ -1634,9 +1634,73 @@ async function processEspionageActions(gameId: number, turn: number): Promise<Ar
 // --- Resolution Helper Functions ---
 
 async function processTradeSettlement(gameId: number): Promise<Array<{ tradeId: number; status: string }>> {
-  // TODO: implement trade settlement (GDD: 거래 체결)
-  // Stub: return empty for now
-  return [];
+  const results: Array<{ tradeId: number; status: string }> = [];
+
+  // 수락된 거래만 체결
+  const acceptedTrades = await db
+    .select()
+    .from(trades)
+    .where(and(eq(trades.gameId, gameId), eq(trades.status, "accepted")));
+
+  for (const trade of acceptedTrades) {
+    if (!trade.proposerId || !trade.responderId) continue;
+
+    const [proposer] = await db.select().from(gamePlayers).where(eq(gamePlayers.id, trade.proposerId));
+    const [responder] = await db.select().from(gamePlayers).where(eq(gamePlayers.id, trade.responderId));
+    if (!proposer || !responder) continue;
+
+    // 거래 내용 (스키마 필드 직접 사용)
+    const offerGold = trade.offerGold ?? 0;
+    const offerFood = trade.offerFood ?? 0;
+    const requestGold = trade.requestGold ?? 0;
+    const requestFood = trade.requestFood ?? 0;
+
+    // 제안자 → 응답자 자원 이전
+    const proposerGoldChange = -offerGold + requestGold;
+    const proposerFoodChange = -offerFood + requestFood;
+    const responderGoldChange = offerGold - requestGold;
+    const responderFoodChange = offerFood - requestFood;
+
+    // 자원 검증 및 이전
+    const proposerNewGold = (proposer.gold ?? 0) + proposerGoldChange;
+    const proposerNewFood = (proposer.food ?? 0) + proposerFoodChange;
+    const responderNewGold = (responder.gold ?? 0) + responderGoldChange;
+    const responderNewFood = (responder.food ?? 0) + responderFoodChange;
+
+    // 자원 부족 시 거래 실패
+    if (proposerNewGold < 0 || proposerNewFood < 0 || responderNewGold < 0 || responderNewFood < 0) {
+      await db.update(trades).set({ status: "failed" as any }).where(eq(trades.id, trade.id));
+      results.push({ tradeId: trade.id, status: "failed" });
+      continue;
+    }
+
+    // 자원 이전 실행
+    await db.update(gamePlayers).set({ gold: proposerNewGold, food: proposerNewFood }).where(eq(gamePlayers.id, trade.proposerId));
+    await db.update(gamePlayers).set({ gold: responderNewGold, food: responderNewFood }).where(eq(gamePlayers.id, trade.responderId));
+
+    // 거래 상태 완료로 변경
+    await db.update(trades).set({ status: "completed" as any }).where(eq(trades.id, trade.id));
+
+    // 우호도 증가 (GDD 18장)
+    const [diplo] = await db
+      .select()
+      .from(diplomacy)
+      .where(and(
+        eq(diplomacy.gameId, gameId),
+        or(
+          and(eq(diplomacy.player1Id, trade.proposerId), eq(diplomacy.player2Id, trade.responderId)),
+          and(eq(diplomacy.player1Id, trade.responderId), eq(diplomacy.player2Id, trade.proposerId))
+        )
+      ));
+    if (diplo) {
+      const newFavor = Math.min(100, (diplo.favorability ?? 0) + 5);
+      await db.update(diplomacy).set({ favorability: newFavor }).where(eq(diplomacy.id, diplo.id));
+    }
+
+    results.push({ tradeId: trade.id, status: "completed" });
+  }
+
+  return results;
 }
 
 async function checkDominationVictory(gameId: number): Promise<number | null> {
@@ -2084,12 +2148,29 @@ async function processMove(action: TurnAction): Promise<void> {
     }
   }
 
-  // 해군 이동 제약: 출발지 또는 도착지가 바다일 경우 항구 도시 확인
+  // 해군 이동 제약: 출발지 또는 도착지가 바다일 경우 항구 건물 확인
   const hasNavy = requested.navy > 0;
   if (hasNavy && (fromTile.terrain === "sea" || toTile.terrain === "sea")) {
-    const fromCity = fromTile.cityId ? await db.select().from(cities).where(eq(cities.id, fromTile.cityId)) : [];
-    const toCity = toTile.cityId ? await db.select().from(cities).where(eq(cities.id, toTile.cityId)) : [];
-    const hasHarbor = [...fromCity, ...toCity].some(city => city && city.grade === "major");
+    // 출발/도착 타일 근처 도시에서 항구 건물 확인
+    const checkCities = [fromTile.cityId, toTile.cityId].filter((id): id is number => id !== null);
+    let hasHarbor = false;
+    
+    for (const cityId of checkCities) {
+      const harborBuilding = await db
+        .select()
+        .from(buildings)
+        .where(and(
+          eq(buildings.gameId, action.gameId!),
+          eq(buildings.cityId, cityId),
+          eq(buildings.buildingType, "shipyard"),
+          eq(buildings.isConstructing, false)
+        ));
+      if (harborBuilding.length > 0) {
+        hasHarbor = true;
+        break;
+      }
+    }
+    
     if (!hasHarbor) {
       // 항구 없이 해군 이동 불가
       return;

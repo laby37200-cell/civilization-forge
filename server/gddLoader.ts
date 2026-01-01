@@ -1,6 +1,6 @@
 import fs from "node:fs";
 import path from "node:path";
-import type { CityGrade, SpecialtyType } from "@shared/schema";
+import { CityGradeStats, CitiesInitialData, type CityGrade, type SpecialtyType } from "@shared/schema";
 
 export interface GDDA_CityRow {
   nationId: string;
@@ -15,7 +15,8 @@ export interface GDDA_CityRow {
 }
 
 const DEFAULT_GDD_PATH = path.resolve(
-  process.cwd(),
+  import.meta.dirname,
+  "..",
   "attached_assets",
   "integrated_gdd_v11_full_1767165854504.md"
 );
@@ -88,11 +89,44 @@ function mapSpecialtyKoToType(s: string): SpecialtyType {
 }
 
 export function loadAppendixA_Cities(gddPath: string = DEFAULT_GDD_PATH): GDDA_CityRow[] {
-  const md = fs.readFileSync(gddPath, "utf-8");
+  let md: string;
+  try {
+    md = fs.readFileSync(gddPath, "utf-8");
+  } catch (e) {
+    console.warn(`[gddLoader] Failed to read GDD at ${gddPath}. Falling back to CitiesInitialData.`, e);
+    return CitiesInitialData.map((c) => {
+      const stats = CityGradeStats[c.grade];
+      return {
+        nationId: c.nationId,
+        nationNameKo: c.nationId,
+        nameKo: c.nameKo,
+        grade: c.grade,
+        initialTroops: stats?.initialTroops ?? 200,
+        initialGold: 5000,
+        initialFood: 3000,
+        specialtyType: "rice_wheat",
+        specialtyAmount: 0,
+      } satisfies GDDA_CityRow;
+    });
+  }
 
   const appendixStartIdx = md.indexOf("# 부록 A: 국가/도시 상세 데이터");
   if (appendixStartIdx < 0) {
-    throw new Error("GDD appendix A not found");
+    console.warn(`[gddLoader] Appendix A not found in GDD. Falling back to CitiesInitialData.`);
+    return CitiesInitialData.map((c) => {
+      const stats = CityGradeStats[c.grade];
+      return {
+        nationId: c.nationId,
+        nationNameKo: c.nationId,
+        nameKo: c.nameKo,
+        grade: c.grade,
+        initialTroops: stats?.initialTroops ?? 200,
+        initialGold: 5000,
+        initialFood: 3000,
+        specialtyType: "rice_wheat",
+        specialtyAmount: 0,
+      } satisfies GDDA_CityRow;
+    });
   }
 
   const appendixBIdx = md.indexOf("# 부록 B:", appendixStartIdx);
@@ -156,6 +190,24 @@ export function loadAppendixA_Cities(gddPath: string = DEFAULT_GDD_PATH): GDDA_C
       initialFood,
       specialtyType,
       specialtyAmount,
+    });
+  }
+
+  if (out.length === 0) {
+    console.warn(`[gddLoader] Parsed 0 city rows from GDD at ${gddPath}. Falling back to CitiesInitialData.`);
+    return CitiesInitialData.map((c) => {
+      const stats = CityGradeStats[c.grade];
+      return {
+        nationId: c.nationId,
+        nationNameKo: c.nationId,
+        nameKo: c.nameKo,
+        grade: c.grade,
+        initialTroops: stats?.initialTroops ?? 200,
+        initialGold: 5000,
+        initialFood: 3000,
+        specialtyType: "rice_wheat",
+        specialtyAmount: 0,
+      } satisfies GDDA_CityRow;
     });
   }
 

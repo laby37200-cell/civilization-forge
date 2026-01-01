@@ -3,6 +3,60 @@ import { UnitStats, type UnitTypeDB } from "@shared/schema";
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
 const DEEPSEEK_API_KEY = process.env.DEEPSEEK_API_KEY;
 
+// GDD 11장: 병과 상성 (가위바위보 시스템)
+// 보병 > 궁병 > 기병 > 보병
+// 공성은 도시 공격 특화, 해군은 바다 전용
+function getUnitTypeBonus(
+  myType: UnitTypeDB,
+  enemyTroops: Record<UnitTypeDB, number>,
+  terrain: string,
+  isCity: boolean
+): number {
+  let bonus = 1.0;
+  
+  const enemyTotal = Object.values(enemyTroops).reduce((a, b) => a + b, 0);
+  if (enemyTotal === 0) return bonus;
+
+  // 적 병과 비율 계산
+  const enemyInfantryRatio = (enemyTroops.infantry ?? 0) / enemyTotal;
+  const enemyCavalryRatio = (enemyTroops.cavalry ?? 0) / enemyTotal;
+  const enemyArcherRatio = (enemyTroops.archer ?? 0) / enemyTotal;
+
+  // 상성 적용
+  switch (myType) {
+    case "infantry":
+      // 보병 > 궁병 (1.2배), 보병 < 기병 (0.8배)
+      bonus += enemyArcherRatio * 0.2;
+      bonus -= enemyCavalryRatio * 0.2;
+      break;
+    case "cavalry":
+      // 기병 > 보병 (1.2배), 기병 < 궁병 (0.8배)
+      bonus += enemyInfantryRatio * 0.2;
+      bonus -= enemyArcherRatio * 0.2;
+      break;
+    case "archer":
+      // 궁병 > 기병 (1.2배), 궁병 < 보병 (0.8배)
+      bonus += enemyCavalryRatio * 0.2;
+      bonus -= enemyInfantryRatio * 0.2;
+      break;
+    case "siege":
+      // 공성: 도시 공격 시 보너스
+      if (isCity) bonus += 0.3;
+      break;
+    case "navy":
+      // 해군: 바다에서만 유효
+      if (terrain === "sea") bonus += 0.25;
+      else bonus -= 0.5;
+      break;
+    case "spy":
+      // 첩보: 전투력 없음
+      bonus = 0.1;
+      break;
+  }
+
+  return Math.max(0.5, Math.min(1.5, bonus));
+}
+
 interface BattleInput {
   attackerTroops: Record<UnitTypeDB, number>;
   defenderTroops: Record<UnitTypeDB, number>;
@@ -48,8 +102,9 @@ function calculateStatsScore(input: BattleInput): { attackerPower: number; defen
   const attackerPower = (Object.entries(input.attackerTroops) as Array<[UnitTypeDB, number]>).reduce(
     (sum, [type, count]) => {
       const base = UnitStats[type]?.attack ?? 1;
-      const mult = getTerrainMultiplier(input.terrain, type, "attacker");
-      return sum + count * base * mult;
+      const terrainMult = getTerrainMultiplier(input.terrain, type, "attacker");
+      const typeMult = getUnitTypeBonus(type, input.defenderTroops, input.terrain, input.isCity);
+      return sum + count * base * terrainMult * typeMult;
     },
     0
   );
@@ -57,8 +112,9 @@ function calculateStatsScore(input: BattleInput): { attackerPower: number; defen
   const defenderTerrainPower = (Object.entries(input.defenderTroops) as Array<[UnitTypeDB, number]>).reduce(
     (sum, [type, count]) => {
       const base = UnitStats[type]?.defense ?? 1;
-      const mult = getTerrainMultiplier(input.terrain, type, "defender");
-      return sum + count * base * mult;
+      const terrainMult = getTerrainMultiplier(input.terrain, type, "defender");
+      const typeMult = getUnitTypeBonus(type, input.attackerTroops, input.terrain, input.isCity);
+      return sum + count * base * terrainMult * typeMult;
     },
     0
   );
