@@ -184,7 +184,7 @@ export function setupWebSocket(httpServer: HttpServer): SocketIOServer {
 
         // Auto-start for local/dev: start when at least 1 player joined.
         if (room.phase === "lobby" && room.players.size >= 1 && !room.turnInterval) {
-          startGame(io, room);
+          await startGame(io, room);
         }
       } catch (error) {
         console.error("[WS] join_room error:", error);
@@ -192,7 +192,7 @@ export function setupWebSocket(httpServer: HttpServer): SocketIOServer {
       }
     });
 
-    socket.on("player_ready", (data: { roomId: number }) => {
+    socket.on("player_ready", async (data: { roomId: number }) => {
       const room = rooms.get(data.roomId);
       if (room && room.players.has(socket.id)) {
         const player = room.players.get(socket.id)!;
@@ -205,7 +205,7 @@ export function setupWebSocket(httpServer: HttpServer): SocketIOServer {
 
         const allReady = Array.from(room.players.values()).every((p) => p.isReady);
         if (allReady && room.phase === "lobby") {
-          startGame(io, room);
+          await startGame(io, room);
         }
       }
     });
@@ -440,10 +440,20 @@ export function setupWebSocket(httpServer: HttpServer): SocketIOServer {
   return io;
 }
 
-function startGame(io: SocketIOServer, room: GameRoom) {
+async function startGame(io: SocketIOServer, room: GameRoom) {
   room.phase = "playing";
   room.currentTurn = 1;
   room.turnEndTime = Date.now() + room.turnDurationSeconds * 1000;
+
+  await db
+    .update(gameRooms)
+    .set({
+      phase: "playing" as any,
+      currentTurn: room.currentTurn,
+      turnEndTime: new Date(room.turnEndTime),
+      lastActiveAt: new Date(),
+    })
+    .where(eq(gameRooms.id, room.id));
 
   io.to(`room_${room.id}`).emit("game_start", {
     turn: room.currentTurn,
@@ -500,9 +510,56 @@ function startTurnTimer(io: SocketIOServer, room: GameRoom): NodeJS.Timeout {
           room.turnInterval = undefined;
           return;
         }
+
+        // Resource updates: notify only affected players
+        for (const r of finalResult.resources ?? []) {
+          const pid = (r as any)?.playerId as number | undefined;
+          if (!pid) continue;
+          room.players.forEach((p, socketId) => {
+            if (p.isSpectator) return;
+            if (!p.gamePlayerId) return;
+            if (p.gamePlayerId !== pid) return;
+            io.to(socketId).emit("resource_update", r);
+          });
+        }
         
         for (const battle of finalResult.battles) {
-          io.to(`room_${room.id}`).emit("battle_result", battle);
+          try {
+            const battleId = (battle as any)?.id as number | undefined;
+            if (!battleId) {
+              io.to(`room_${room.id}`).emit("battle_result", battle);
+              continue;
+            }
+
+            const [row] = await db
+              .select({
+                id: battles.id,
+                attackerId: battles.attackerId,
+                defenderId: battles.defenderId,
+                attackerTroops: battles.attackerTroops,
+                defenderTroops: battles.defenderTroops,
+                result: battles.result,
+                cityId: battles.cityId,
+                terrain: hexTiles.terrain,
+              })
+              .from(battles)
+              .leftJoin(hexTiles, eq(battles.tileId, hexTiles.id))
+              .where(and(eq(battles.gameId, room.id), eq(battles.id, battleId)));
+
+            io.to(`room_${room.id}`).emit("battle_result", {
+              ...(battle as any),
+              id: row ? row.id : battleId,
+              attackerId: row?.attackerId ?? (battle as any)?.attackerId,
+              defenderId: row?.defenderId ?? (battle as any)?.defenderId,
+              result: (row?.result ?? (battle as any)?.result) as any,
+              cityId: row?.cityId ?? null,
+              terrain: row?.terrain ?? "plains",
+              attackerTroops: (row?.attackerTroops ?? (battle as any)?.attackerTroops) ?? {},
+              defenderTroops: (row?.defenderTroops ?? (battle as any)?.defenderTroops) ?? {},
+            });
+          } catch (e) {
+            io.to(`room_${room.id}`).emit("battle_result", battle);
+          }
         }
         
         const allianceRows = await db
@@ -525,9 +582,10 @@ function startTurnTimer(io: SocketIOServer, room: GameRoom): NodeJS.Timeout {
         for (const newsItem of finalResult.news) {
           const involved = ((newsItem as any)?.involvedPlayerIds ?? []) as number[];
           const visibility = (newsItem as any)?.visibility as string | undefined;
+          const payload = { ...(newsItem as any), turn: previousTurn };
 
           if (!visibility || visibility === "global") {
-            io.to(`room_${room.id}`).emit("news_update", newsItem);
+            io.to(`room_${room.id}`).emit("news_update", payload);
             continue;
           }
 
@@ -547,7 +605,7 @@ function startTurnTimer(io: SocketIOServer, room: GameRoom): NodeJS.Timeout {
             if (p.isSpectator) return;
             if (!p.gamePlayerId) return;
             if (!allowed.has(p.gamePlayerId)) return;
-            io.to(socketId).emit("news_update", newsItem);
+            io.to(socketId).emit("news_update", payload);
           });
         }
       } catch (error) {

@@ -144,11 +144,13 @@ export default function Game() {
   const [turnEndTime, setTurnEndTime] = useState<number | null>(null);
   const [turnDuration, setTurnDuration] = useState(45);
   const [timeRemaining, setTimeRemaining] = useState(turnDuration);
+  const [turnPhase, setTurnPhase] = useState<"action" | "resolution">("action");
   const [activeTab, setActiveTab] = useState("map");
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [news, setNews] = useState<NewsItem[]>([]);
   const [battleOpen, setBattleOpen] = useState(false);
   const [currentBattle, setCurrentBattle] = useState<BattleData | null>(null);
+  const [battleIsAttacker, setBattleIsAttacker] = useState(true);
 
   const [currentUser, setCurrentUser] = useState<{ id: number; username: string } | null>(null);
   const [players, setPlayers] = useState<GamePlayer[]>([]);
@@ -392,15 +394,24 @@ export default function Game() {
       cities: City[];
       tiles: HexTile[];
       units?: Unit[];
+      buildings?: Building[];
       specialties?: Specialty[];
+      spies?: Spy[];
       news?: NewsItem[];
       chat?: ChatMessage[];
     };
+
+    const nextTurnDuration = roomJson.room?.turnDuration ?? 45;
+    setTurnDuration(nextTurnDuration);
+    setCurrentTurn(roomJson.room?.currentTurn ?? 1);
+    setTurnEndTime(roomJson.room?.turnEndTime ?? null);
     setTiles(roomJson.tiles ?? []);
     setCities(roomJson.cities ?? []);
     setPlayers(roomJson.players ?? []);
     setUnits(roomJson.units ?? []);
+    setBuildings(roomJson.buildings ?? []);
     setSpecialties(roomJson.specialties ?? []);
+    setSpies(roomJson.spies ?? []);
     setNews(roomJson.news ?? []);
     setMessages(roomJson.chat ?? []);
   }, [roomId]);
@@ -448,25 +459,34 @@ export default function Game() {
     const onGameStart = (payload: { turn: number; turnEndTime: number | null }) => {
       setCurrentTurn(payload.turn);
       setTurnEndTime(payload.turnEndTime ?? null);
+      setTurnPhase("action");
     };
 
     const onTurnEnd = (payload: { turn: number; turnEndTime: number | null }) => {
       setCurrentTurn(payload.turn);
       setTurnEndTime(payload.turnEndTime ?? null);
+      setTurnPhase("action");
     };
 
-    const onChatMessage = (payload: { oderId?: number; username?: string; message: string; timestamp: number }) => {
+    const onChatMessage = (payload: {
+      senderPlayerId: number;
+      senderName: string;
+      message: string;
+      channel: ChatMessage["channel"];
+      targetId?: number | null;
+      timestamp: number;
+    }) => {
       const m: ChatMessage = {
         id: String(payload.timestamp),
         roomId: String(rid),
-        senderId: String(payload.oderId ?? ""),
-        senderName: payload.username ?? "-",
+        senderId: String(payload.senderPlayerId),
+        senderName: payload.senderName ?? "-",
         content: payload.message,
-        channel: "global",
-        targetId: null,
+        channel: payload.channel,
+        targetId: payload.targetId === null || payload.targetId === undefined ? null : String(payload.targetId),
         timestamp: payload.timestamp,
       };
-      setMessages((prev: ChatMessage[]) => [...prev, m]);
+      setMessages((prev: ChatMessage[]) => (prev.some((x) => x.id === m.id) ? prev : [...prev, m]));
     };
 
     const onNationSelected = (payload: { oderId: number; nationId: string; color: string }) => {
@@ -493,28 +513,65 @@ export default function Game() {
       console.log(`[WS] Turn ${payload.turn} resolving...`);
     };
 
+    const onTurnPhase = (payload: { phase: string; turn: number }) => {
+      if (payload.phase === "resolution") {
+        setTurnPhase("resolution");
+      } else {
+        setTurnPhase("action");
+      }
+    };
+
     const onTurnResolved = (payload: { turn: number; battles: unknown[]; resources: unknown[]; news: unknown[] }) => {
       console.log(`[WS] Turn ${payload.turn} resolved:`, payload);
       refetchRoomState();
     };
 
-    const onBattleResult = (payload: { id: number; attackerId: number; defenderId: number; result: string; narrative: string }) => {
+    const onBattleResult = (payload: {
+      id: number;
+      attackerId: number;
+      defenderId: number;
+      result: string;
+      narrative: string;
+      terrain?: string;
+      cityId?: number | null;
+      attackerTroops?: unknown;
+      defenderTroops?: unknown;
+    }) => {
       toast({
         title: payload.result === "attacker_win" ? "공격 성공!" : payload.result === "defender_win" ? "방어 성공!" : "무승부",
         description: payload.narrative,
       });
     };
 
-    const onNewsUpdate = (payload: { category: string; title: string; content: string; involvedPlayerIds?: number[] }) => {
-      setNews((prev) => [{
-        id: String(Date.now()),
-        turn: currentTurn,
+    const onNewsUpdate = (payload: {
+      id?: string | number;
+      turn?: number;
+      category: string;
+      title: string;
+      content: string;
+      involvedPlayerIds?: number[];
+      involvedPlayers?: string[];
+      timestamp?: number;
+    }) => {
+      const turn = payload.turn ?? currentTurn;
+      const involvedPlayers = payload.involvedPlayers ?? (payload.involvedPlayerIds ?? []).map((x) => String(x));
+      const timestamp = payload.timestamp ?? Date.now();
+      const id =
+        payload.id !== undefined
+          ? String(payload.id)
+          : `${turn}:${payload.category}:${payload.title}:${payload.content}`;
+
+      const item: NewsItem = {
+        id,
+        turn,
         category: payload.category as NewsItem["category"],
         title: payload.title,
         content: payload.content,
-        involvedPlayers: (payload.involvedPlayerIds ?? []).map((x) => String(x)),
-        timestamp: Date.now(),
-      }, ...prev].slice(0, 50));
+        involvedPlayers,
+        timestamp,
+      };
+
+      setNews((prev) => (prev.some((x) => x.id === item.id) ? prev : [item, ...prev].slice(0, 50)));
     };
 
     const onResourceUpdate = (payload: { playerId: number; goldChange: number; foodChange: number }) => {
@@ -541,9 +598,11 @@ export default function Game() {
     socket.on("nation_selected", onNationSelected);
     socket.on("city_selected", onCitySelected);
     socket.on("turn_resolving", onTurnResolving);
+    socket.on("turn_phase", onTurnPhase);
     socket.on("turn_resolved", onTurnResolved);
     socket.on("battle_result", onBattleResult);
     socket.on("news_update", onNewsUpdate);
+    socket.on("resource_update", onResourceUpdate);
     socket.on("room_deleted", onRoomDeleted);
 
     return () => {
@@ -553,9 +612,11 @@ export default function Game() {
       socket.off("nation_selected", onNationSelected);
       socket.off("city_selected", onCitySelected);
       socket.off("turn_resolving", onTurnResolving);
+      socket.off("turn_phase", onTurnPhase);
       socket.off("turn_resolved", onTurnResolved);
       socket.off("battle_result", onBattleResult);
       socket.off("news_update", onNewsUpdate);
+      socket.off("resource_update", onResourceUpdate);
       socket.off("room_deleted", onRoomDeleted);
     };
   }, [roomId, currentUser, players, currentTurn, currentPlayer, refetchRoomState, toast]);
@@ -580,24 +641,18 @@ export default function Game() {
     setSelectedTileId(tileId);
   }, [moveOpen, attackOpen, actionFromTileId]);
 
-  const handleSendMessage = useCallback((content: string, channel: ChatMessage["channel"]) => {
+  const handleSendMessage = useCallback((content: string, channel: ChatMessage["channel"], targetId?: string | null) => {
     const rid = roomId;
     if (!rid) return;
     const socket = getSocket();
-    socket.emit("chat", { roomId: rid, message: content });
-
-    const newMessage: ChatMessage = {
-      id: Date.now().toString(),
-      roomId: String(rid),
-      senderId: String(currentUser?.id ?? ""),
-      senderName: currentUser?.username ?? "-",
-      content,
+    const parsedTargetId = targetId ? Number(targetId) : null;
+    socket.emit("chat", {
+      roomId: rid,
+      message: content,
       channel,
-      targetId: null,
-      timestamp: Date.now(),
-    };
-    setMessages((prev: ChatMessage[]) => [...prev, newMessage]);
-  }, [roomId, currentUser]);
+      targetId: Number.isFinite(parsedTargetId) ? parsedTargetId : null,
+    });
+  }, [roomId]);
 
   const submitTurnAction = useCallback((actionType: string, actionData: unknown) => {
     const rid = roomId;
@@ -707,14 +762,24 @@ export default function Game() {
       toast({ title: "공격할 병력이 없습니다", variant: "destructive" });
       return;
     }
-    submitTurnAction("attack", {
-      fromTileId: actionFromTileId,
-      targetTileId: actionTargetTileId,
-      units: actionUnits,
-      strategy: attackStrategy,
+    const targetTile = tiles.find((t) => t.id === actionTargetTileId);
+    const defenderId = targetTile?.ownerId ?? null;
+    const defenderTroops = defenderId ? getTroopsForTile(actionTargetTileId, defenderId) : { infantry: 0, cavalry: 0, archer: 0, siege: 0, navy: 0, spy: 0 };
+
+    setCurrentBattle({
+      id: `attack-${Date.now()}`,
+      attackerId: String(currentPlayer?.id ?? ""),
+      defenderId: String(defenderId ?? ""),
+      attackerTroops: actionUnits,
+      defenderTroops,
+      terrain: targetTile?.terrain ?? "plains",
+      cityId: targetTile?.cityId == null ? null : String(targetTile.cityId),
+      result: null,
     });
+    setBattleIsAttacker(true);
+    setBattleOpen(true);
     setAttackOpen(false);
-  }, [actionFromTileId, actionTargetTileId, actionUnits, attackStrategy, submitTurnAction, toast]);
+  }, [actionFromTileId, actionTargetTileId, actionUnits, tiles, currentPlayer, getTroopsForTile, toast]);
 
   const resources = {
     troops: currentPlayerTroops,
@@ -838,7 +903,7 @@ export default function Game() {
             currentTurn={currentTurn}
             turnDuration={turnDuration}
             timeRemaining={timeRemaining}
-            phase="action"
+            phase={turnPhase}
           />
         </div>
 
@@ -1050,11 +1115,21 @@ export default function Game() {
         open={battleOpen}
         onClose={() => setBattleOpen(false)}
         battle={currentBattle}
-        isAttacker={true}
+        isAttacker={battleIsAttacker}
         timeRemaining={timeRemaining}
         onSubmitStrategy={(strategy) => {
-          console.log("Strategy submitted:", strategy);
+          if (!actionFromTileId || !actionTargetTileId) {
+            setBattleOpen(false);
+            return;
+          }
+          submitTurnAction("attack", {
+            fromTileId: actionFromTileId,
+            targetTileId: actionTargetTileId,
+            units: actionUnits,
+            strategy,
+          });
           setBattleOpen(false);
+          setCurrentBattle(null);
         }}
       />
 

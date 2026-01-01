@@ -1,38 +1,87 @@
 import type { Express } from "express";
 import type { Server } from "http";
 import { db } from "./db";
-import {
-  aiMemory,
-  battles,
-  buildings,
-  chatMessages,
-  cities,
-  CityGradeStats,
-  diplomacy,
-  gamePlayers,
+import { 
+  turnActions, 
+  hexTiles, 
+  cities, 
+  gamePlayers, 
   gameRooms,
-  hexTiles,
-  insertUserSchema,
-  NationsInitialData,
+  battles, 
   news,
   specialties,
-  spies,
-  trades,
-  turnActions,
   units,
-  users,
-  type AIDifficulty,
-  type ChatChannelDB,
-  type NewsVisibilityDB,
-  type SpyLocationType,
-  type SpyMission,
+  buildings,
+  diplomacy,
+  trades,
+  spies,
+  aiMemory,
+  CityGradeStats,
+  UnitStats,
+  BuildingStats,
+  type TurnAction,
   type UnitTypeDB,
+  type BuildingType,
+  type TerrainType,
+  type SpecialtyType,
+  City,
+  Building,
+  type Trade,
+  type TradeStatus,
+  type Spy,
+  type SpyMission,
+  type SpyLocationType,
+  type NewsVisibilityDB,
+  users,
+  chatMessages,
+  type ChatChannelDB,
+  insertUserSchema
 } from "@shared/schema";
-import { and, eq, inArray, or, sql } from "drizzle-orm";
-import { hash, compare } from "bcrypt";
+import { eq, and, sql, gt, lt, or, ne, inArray, isNotNull } from "drizzle-orm";
+import { generateNewsNarrative, judgeBattle } from "./llm";
+import { getNeighbors } from "./turnResolution";
 import { loadAppendixA_Cities } from "./gddLoader";
 import { deploySpy, proposeTrade, respondTrade } from "./turnResolution";
+import { hash, compare } from "bcrypt";
+import { NationsInitialData, type AIDifficulty } from "./gddLoader";
 
+// Share existing vision between new allies
+async function shareAllianceVision(gameId: number, player1Id: number, player2Id: number) {
+  // Get all tiles visible to player1
+  const player1Tiles = await db
+    .select({ id: hexTiles.id, fogOfWar: hexTiles.fogOfWar })
+    .from(hexTiles)
+    .where(eq(hexTiles.gameId, gameId));
+  
+  // Get all tiles visible to player2
+  const player2Tiles = await db
+    .select({ id: hexTiles.id, fogOfWar: hexTiles.fogOfWar })
+    .from(hexTiles)
+    .where(eq(hexTiles.gameId, gameId));
+
+  // Update tiles to share vision
+  for (const tile of player1Tiles) {
+    const fogArray = Array.isArray(tile.fogOfWar) ? tile.fogOfWar as number[] : [];
+    if (fogArray.includes(player1Id) && !fogArray.includes(player2Id)) {
+      const updatedFog = [...fogArray, player2Id];
+      await db
+        .update(hexTiles)
+        .set({ fogOfWar: updatedFog })
+        .where(and(eq(hexTiles.gameId, gameId), eq(hexTiles.id, tile.id)));
+    }
+  }
+
+  for (const tile of player2Tiles) {
+    const fogArray = Array.isArray(tile.fogOfWar) ? tile.fogOfWar as number[] : [];
+    if (fogArray.includes(player2Id) && !fogArray.includes(player1Id)) {
+      const updatedFog = [...fogArray, player1Id];
+      await db
+        .update(hexTiles)
+        .set({ fogOfWar: updatedFog })
+        .where(and(eq(hexTiles.gameId, gameId), eq(hexTiles.id, tile.id)));
+    }
+  }
+}
 export async function registerRoutes(httpServer: Server, app: Express): Promise<Server> {
   
   // === AUTH ROUTES ===
@@ -288,6 +337,17 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
       timestamp: m.createdAt ? new Date(m.createdAt).getTime() : Date.now(),
     }));
 
+    const tilesWithFog = tiles.map((t) => {
+      const exploredForViewer =
+        viewerPlayerId == null
+          ? true
+          : Array.isArray((t as any).fogOfWar)
+            ? ((t as any).fogOfWar as number[]).includes(viewerPlayerId)
+            : false;
+      const { fogOfWar: _fogOfWar, ...rest } = t as any;
+      return { ...rest, isExplored: exploredForViewer };
+    });
+
     res.json({
       room: {
         ...room,
@@ -295,7 +355,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
       },
       players,
       cities: cityList,
-      tiles,
+      tiles: tilesWithFog,
       units: unitList,
       buildings: buildingList,
       specialties: specialtyList,
@@ -350,7 +410,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
 
     const roomId = parseInt(req.params.id);
     const nationId = String(req.body?.nationId ?? "").trim();
-    const nation = NationsInitialData.find((n) => n.id === nationId);
+    const nation = NationsInitialData.find((n: { id: string }) => n.id === nationId);
     if (!nation) {
       return res.status(400).json({ error: "Invalid nationId" });
     }
@@ -440,6 +500,48 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
         .update(hexTiles)
         .set({ ownerId: player.id, troops: stats.initialTroops })
         .where(eq(hexTiles.id, city.centerTileId));
+
+      const [center] = await db
+        .select({ q: hexTiles.q, r: hexTiles.r })
+        .from(hexTiles)
+        .where(and(eq(hexTiles.gameId, roomId), eq(hexTiles.id, city.centerTileId)));
+
+      if (center) {
+        const directions: Array<[number, number]> = [
+          [1, 0],
+          [1, -1],
+          [0, -1],
+          [-1, 0],
+          [-1, 1],
+          [0, 1],
+        ];
+        const neighborCoords = directions.map(([dq, dr]) => ({ q: center.q + dq, r: center.r + dr }));
+        const neighbors = await db
+          .select({ id: hexTiles.id })
+          .from(hexTiles)
+          .where(
+            and(
+              eq(hexTiles.gameId, roomId),
+              or(
+                ...neighborCoords.map((c) => and(eq(hexTiles.q, c.q), eq(hexTiles.r, c.r)))
+              )
+            )
+          );
+
+        const revealIds = [city.centerTileId, ...neighbors.map((n) => n.id)];
+        for (const tid of revealIds) {
+          const [tile] = await db
+            .select({ fogOfWar: hexTiles.fogOfWar })
+            .from(hexTiles)
+            .where(and(eq(hexTiles.gameId, roomId), eq(hexTiles.id, tid)));
+          const existing = Array.isArray(tile?.fogOfWar) ? (tile.fogOfWar as number[]) : [];
+          const next = Array.from(new Set<number>([...existing, player.id]));
+          await db
+            .update(hexTiles)
+            .set({ fogOfWar: next })
+            .where(and(eq(hexTiles.gameId, roomId), eq(hexTiles.id, tid)));
+        }
+      }
     }
 
     res.json(updatedCity);
@@ -526,6 +628,11 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
         favorability,
         lastChanged: new Date(),
       });
+    }
+
+    // If forming an alliance, share existing vision between allies
+    if (status === "alliance") {
+      await shareAllianceVision(roomId, player.id, targetPlayerId);
     }
 
     const [roomRow] = await db
@@ -869,7 +976,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
       const nationsForAI = shuffledNations.slice(0, Math.min(room.aiPlayerCount, shuffledNations.length));
 
       const aiDifficulty = (room.aiDifficulty ?? "normal") as AIDifficulty;
-      const aiPlayerRows = nationsForAI.map((nation) => ({
+      const aiPlayerRows = nationsForAI.map((nation: { id: string; color: string }) => ({
         gameId: roomId,
         nationId: nation.id,
         isAI: true,

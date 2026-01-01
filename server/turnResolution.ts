@@ -68,6 +68,36 @@ async function processEspionagePowerGrowth(gameId: number): Promise<void> {
   }
 }
 
+function getAIPersonalityVector(
+  difficulty: unknown,
+  phase: string
+): {
+  expansion: number;
+  economy: number;
+  military: number;
+  diplomacy: number;
+  espionage: number;
+  risk: number;
+} {
+  const base =
+    difficulty === "easy"
+      ? { expansion: 1.0, economy: 1.15, military: 0.85, diplomacy: 1.1, espionage: 0.9, risk: 0.8 }
+      : difficulty === "hard"
+        ? { expansion: 1.1, economy: 0.95, military: 1.25, diplomacy: 0.9, espionage: 1.15, risk: 1.15 }
+        : { expansion: 1.0, economy: 1.0, military: 1.0, diplomacy: 1.0, espionage: 1.0, risk: 1.0 };
+
+  if (phase === "expansion") {
+    return { ...base, expansion: base.expansion + 0.2, economy: base.economy + 0.05, military: base.military - 0.05 };
+  }
+  if (phase === "consolidation") {
+    return { ...base, economy: base.economy + 0.2, diplomacy: base.diplomacy + 0.05, military: base.military - 0.05 };
+  }
+  if (phase === "victory") {
+    return { ...base, military: base.military + 0.25, expansion: base.expansion + 0.05 };
+  }
+  return base;
+}
+
 interface TurnResolutionResult {
   battleResults: Array<{
     id: number;
@@ -285,6 +315,9 @@ export async function runResolutionPhase(gameId: number, turn: number): Promise<
   };
 }
 
+// Export getNeighbors for use in routes.ts
+export { getNeighbors };
+
 // --- GDD 17장: 외교 시스템 (동맹 효과/배신/휴전 등) ---
 
 // 외교 관계 처리 (턴마다 동맹 효과/배신 페널티 등)
@@ -331,6 +364,52 @@ export async function processBetrayal(gameId: number, initiatorId: number, targe
   if ((oldStatus === "alliance" || oldStatus === "friendly") && (newStatus === "war" || newStatus === "hostile")) {
     // TODO: 우호도 대폭 감소, 글로벌 배신 낙인, 턴 디버프
     console.log(`[Diplomacy] Betrayal: player ${initiatorId} betrayed player ${targetId}`);
+    
+    // Remove shared vision when alliance is broken
+    if (oldStatus === "alliance") {
+      await removeAllianceVision(gameId, initiatorId, targetId);
+    }
+  }
+}
+
+// Remove shared vision between former allies
+async function removeAllianceVision(gameId: number, player1Id: number, player2Id: number) {
+  // Get all tiles that have shared vision
+  const tiles = await db
+    .select({ id: hexTiles.id, fogOfWar: hexTiles.fogOfWar })
+    .from(hexTiles)
+    .where(eq(hexTiles.gameId, gameId));
+
+  for (const tile of tiles) {
+    const fogArray = Array.isArray(tile.fogOfWar) ? tile.fogOfWar as number[] : [];
+    
+    // Only remove vision if it was gained through alliance (not if player discovered it themselves)
+    // For simplicity, we'll remove the ally's vision from tiles that both can see
+    if (fogArray.includes(player1Id) && fogArray.includes(player2Id)) {
+      // Check if tile is owned by either player or adjacent to their cities
+      const [tileData] = await db
+        .select({ ownerId: hexTiles.ownerId })
+        .from(hexTiles)
+        .where(and(eq(hexTiles.gameId, gameId), eq(hexTiles.id, tile.id)));
+      
+      const isOwnedByPlayer1 = tileData?.ownerId === player1Id;
+      const isOwnedByPlayer2 = tileData?.ownerId === player2Id;
+      
+      // If not owned by the player, remove the ally's vision
+      if (isOwnedByPlayer1) {
+        const updatedFog = fogArray.filter(id => id !== player2Id);
+        await db
+          .update(hexTiles)
+          .set({ fogOfWar: updatedFog })
+          .where(and(eq(hexTiles.gameId, gameId), eq(hexTiles.id, tile.id)));
+      } else if (isOwnedByPlayer2) {
+        const updatedFog = fogArray.filter(id => id !== player1Id);
+        await db
+          .update(hexTiles)
+          .set({ fogOfWar: updatedFog })
+          .where(and(eq(hexTiles.gameId, gameId), eq(hexTiles.id, tile.id)));
+      }
+    }
   }
 }
 
@@ -999,7 +1078,27 @@ function calculateActionScore(
     baseScore += 25;
   }
   
-  return baseScore;
+  const personality = (mem.aiPersonality as any) ?? null;
+  if (!personality) return baseScore;
+
+  const vec = personality as {
+    expansion?: number;
+    economy?: number;
+    military?: number;
+    diplomacy?: number;
+    espionage?: number;
+    risk?: number;
+  };
+
+  let weight = 1;
+  if (actionKind === "move") weight = vec.expansion ?? 1;
+  else if (actionKind === "build") weight = vec.economy ?? 1;
+  else if (actionKind === "recruit") weight = vec.military ?? 1;
+  else if (actionKind === "attack") weight = (vec.military ?? 1) * (vec.risk ?? 1);
+  else if (actionKind === "diplomacy") weight = vec.diplomacy ?? 1;
+  else if (actionKind === "espionage") weight = vec.espionage ?? 1;
+
+  return Math.floor(baseScore * weight);
 }
 
 function getAIDifficultyProfile(difficulty: unknown): {
@@ -1092,6 +1191,9 @@ async function processAIDecisions(gameId: number, turn: number): Promise<number[
     await assessStrategicSituation(gameId, p.id, mem);
 
     const profile = getAIDifficultyProfile(p.aiDifficulty);
+
+    const aiPhase = (mem.strategyPhase as string) || "expansion";
+    (mem as any).aiPersonality = getAIPersonalityVector(p.aiDifficulty, aiPhase);
     
     // 군사 압박 여부 확인
     const threatAssessment = mem.threatAssessment as any;
@@ -1157,22 +1259,21 @@ async function processAIDecisions(gameId: number, turn: number): Promise<number[
     }
     
     // === 전략적 건설 ===
-    const phase = mem.strategyPhase as string;
-    if (phase === "expansion" && !has("barracks") && currentResources.gold >= 500) {
+    if (aiPhase === "expansion" && !has("barracks") && currentResources.gold >= 500) {
       candidates.push({
         kind: "build",
         score: calculateActionScore("build", mem, turn, currentResources, militaryPressure),
         actionType: "build",
         actionData: { cityId, buildingType: "barracks" },
       });
-    } else if (phase === "consolidation" && !has("bank") && currentResources.gold >= 1200) {
+    } else if (aiPhase === "consolidation" && !has("bank") && currentResources.gold >= 1200) {
       candidates.push({
         kind: "build",
         score: calculateActionScore("build", mem, turn, currentResources, militaryPressure) + 15,
         actionType: "build",
         actionData: { cityId, buildingType: "bank" },
       });
-    } else if (phase === "victory" && !has("fortress") && currentResources.gold >= 2000) {
+    } else if (aiPhase === "victory" && !has("fortress") && currentResources.gold >= 2000) {
       candidates.push({
         kind: "build",
         score: calculateActionScore("build", mem, turn, currentResources, militaryPressure) + 20,
@@ -1182,7 +1283,7 @@ async function processAIDecisions(gameId: number, turn: number): Promise<number[
     }
     
     // === 징병 전략 ===
-    const targetTroops = phase === "victory" ? 1500 : phase === "consolidation" ? 1000 : 500;
+    const targetTroops = aiPhase === "victory" ? 1500 : aiPhase === "consolidation" ? 1000 : 500;
     const currentTroops = await getCityTroops(gameId, cityId);
     if (currentTroops < targetTroops && currentResources.gold >= 500) {
       candidates.push({
@@ -1194,7 +1295,7 @@ async function processAIDecisions(gameId: number, turn: number): Promise<number[
     }
 
     // === 공격 전략 (승리 단계에서) ===
-    if (phase === "victory" && threatAssessment.hostilePlayers.length > 0) {
+    if (aiPhase === "victory" && threatAssessment.hostilePlayers.length > 0) {
       // 가장 가까운 적 도시 찾기
       const targetCity = await findNearestEnemyCity(gameId, cityCenterTileId, threatAssessment.hostilePlayers);
       if (targetCity && currentTroops > 800) {
@@ -1302,7 +1403,7 @@ async function processAIDecisions(gameId: number, turn: number): Promise<number[
     // 인접 타일 확인 및 공격/이동 기회
     const [center] = await db.select({ q: hexTiles.q, r: hexTiles.r }).from(hexTiles).where(eq(hexTiles.id, cityCenterTileId));
     if (center) {
-      const neighbors = await getNeighbors(center.q, center.r);
+      const neighbors = await getNeighbors(gameId, center.q, center.r);
       const neighborTiles = await db
         .select()
         .from(hexTiles)
@@ -1312,7 +1413,7 @@ async function processAIDecisions(gameId: number, turn: number): Promise<number[
       const adjacentNeutral = neighborTiles.find((t) => t.ownerId == null);
       
       // 공격 기회 (우세할 때만)
-      if (adjacentEnemy && phase !== "expansion") {
+      if (adjacentEnemy && aiPhase !== "expansion") {
         const available = await getTileTroops(gameId, cityCenterTileId, p.id);
         const enemyTroops = await getTileTroops(gameId, adjacentEnemy.id, adjacentEnemy.ownerId!);
         const myPower = available.infantry + available.cavalry * 1.2 + available.archer * 1.1 + available.siege * 1.3;
@@ -1337,7 +1438,7 @@ async function processAIDecisions(gameId: number, turn: number): Promise<number[
       }
       
       // 중립 확장 (초기 단계에서)
-      if (adjacentNeutral && phase === "expansion") {
+      if (adjacentNeutral && aiPhase === "expansion") {
         const available = await getTileTroops(gameId, cityCenterTileId, p.id);
         const sendInf = Math.min(available.infantry, Math.max(50, Math.floor(available.infantry * 0.3)));
         if (sendInf > 0) {
@@ -1378,7 +1479,7 @@ async function processAIDecisions(gameId: number, turn: number): Promise<number[
       .where(and(eq(spies.gameId, gameId), eq(spies.playerId, p.id), eq(spies.isAlive, true)));
     
     const idleSpy = mySpies.find((s) => s.mission === "idle");
-    if (idleSpy && phase !== "expansion") {
+    if (idleSpy && aiPhase !== "expansion") {
       const enemyCity = await db
         .select({ id: cities.id })
         .from(cities)
@@ -1402,7 +1503,7 @@ async function processAIDecisions(gameId: number, turn: number): Promise<number[
       ? memAny.targetCities
       : [];
     memAny.targetCities = targetCities;
-    if (phase !== "expansion" && targetCities.length === 0) {
+    if (aiPhase !== "expansion" && targetCities.length === 0) {
       // 공략 목표 도시 선정
       const potentialTargets = await db
         .select({ 
@@ -1444,7 +1545,7 @@ async function processAIDecisions(gameId: number, turn: number): Promise<number[
     }
     
     // 목표 도시를 향한 전략적 이동/공격
-    if (phase === "victory" && targetCities.length > 0) {
+    if (aiPhase === "victory" && targetCities.length > 0) {
       const topTarget = targetCities[0];
       const targetCity = await db
         .select({ centerTileId: cities.centerTileId })
@@ -1783,6 +1884,9 @@ async function processAttack(
 
     await syncTileTroops(gameId, targetTile.id);
 
+    // --- GDD 4장: 점령 후 시야 확보 (점령 타일 + 주변) ---
+    await updateFogOfWar(gameId, action.playerId, targetTile.id);
+
     if (targetTile.cityId) {
       const [city] = await db.select().from(cities).where(eq(cities.id, targetTile.cityId));
       await db.update(cities).set({ ownerId: action.playerId }).where(eq(cities.id, targetTile.cityId));
@@ -2027,15 +2131,8 @@ async function updateFogOfWar(gameId: number, playerId: number, centerTileId: nu
   const [center] = await db.select().from(hexTiles).where(eq(hexTiles.id, centerTileId));
   if (!center) return;
 
-  const neighbors = await getNeighbors(center.q, center.r);
+  const neighbors = await getNeighbors(gameId, center.q, center.r);
   const tilesToReveal = [centerTileId, ...neighbors.map(t => t.id)];
-
-  for (const tileId of tilesToReveal) {
-    await db
-      .update(hexTiles)
-      .set({ isExplored: true })
-      .where(and(eq(hexTiles.gameId, gameId), eq(hexTiles.id, tileId)));
-  }
 
   // 동맹 시야 공유: 동맹국 플레이어에게도 시야 복사
   const alliances = await db
@@ -2048,14 +2145,25 @@ async function updateFogOfWar(gameId: number, playerId: number, centerTileId: nu
     if (d.player2Id === playerId && d.player1Id != null) allyIds.add(d.player1Id);
   }
 
-  allyIds.forEach((allyId) => {
-    // TODO: 동맹 시야 공유 구현 (fogOfWar JSON 필드 활용)
-    // 임시: 아무것도 안 함
-  });
+  const viewersToGrant = [playerId, ...Array.from(allyIds)];
+
+  for (const tileId of tilesToReveal) {
+    const [tile] = await db
+      .select({ fogOfWar: hexTiles.fogOfWar })
+      .from(hexTiles)
+      .where(and(eq(hexTiles.gameId, gameId), eq(hexTiles.id, tileId)));
+
+    const existing = Array.isArray(tile?.fogOfWar) ? (tile.fogOfWar as number[]) : [];
+    const next = Array.from(new Set<number>([...existing, ...viewersToGrant]));
+    await db
+      .update(hexTiles)
+      .set({ fogOfWar: next })
+      .where(and(eq(hexTiles.gameId, gameId), eq(hexTiles.id, tileId)));
+  }
 }
 
 // 인접 6타일 조회 (hex 좌표 기반)
-async function getNeighbors(q: number, r: number): Promise<Array<{ id: number; q: number; r: number }>> {
+async function getNeighbors(gameId: number, q: number, r: number): Promise<Array<{ id: number; q: number; r: number }>> {
   const directions = [
     [1, 0], [1, -1], [0, -1],
     [-1, 0], [-1, 1], [0, 1],
@@ -2065,9 +2173,12 @@ async function getNeighbors(q: number, r: number): Promise<Array<{ id: number; q
     .select({ id: hexTiles.id, q: hexTiles.q, r: hexTiles.r })
     .from(hexTiles)
     .where(
-      sql`game_id = (select game_id from hex_tiles where q = ${q} and r = ${r} limit 1) and (${neighborCoords
-        .map((coord) => sql`(q = ${coord.q} and r = ${coord.r})`)
-        .reduce((acc, curr) => sql`${acc} or ${curr}`)})`
+      and(
+        eq(hexTiles.gameId, gameId),
+        sql`(${neighborCoords
+          .map((coord) => sql`(q = ${coord.q} and r = ${coord.r})`)
+          .reduce((acc, curr) => sql`${acc} or ${curr}`)})`
+      )
     );
   return neighbors;
 }
@@ -2082,16 +2193,14 @@ async function updateCityCluster(gameId: number, cityId: number, ownerId: number
   const [centerTile] = await db.select().from(hexTiles).where(eq(hexTiles.id, city.centerTileId!));
   if (!centerTile) return;
 
-  const neighbors = await getNeighbors(centerTile.q, centerTile.r);
+  const neighbors = await getNeighbors(gameId, centerTile.q, centerTile.r);
   const clusterTileIds = [city.centerTileId!, ...neighbors.map(t => t.id)];
 
-  // 클러스터 타일들을 도시 소유로 갱신 (이미 소유된 타일은 제외)
-  for (const tileId of clusterTileIds) {
-    await db
-      .update(hexTiles)
-      .set({ ownerId, cityId })
-      .where(and(eq(hexTiles.gameId, gameId), eq(hexTiles.id, tileId), sql`owner_id is null or owner_id = ${ownerId}`));
-  }
+  // 클러스터 타일들을 도시 소유로 갱신
+  await db
+    .update(hexTiles)
+    .set({ ownerId, cityId })
+    .where(and(eq(hexTiles.gameId, gameId), inArray(hexTiles.id, clusterTileIds)));
 }
 
 // 도시 클러스터 내 타일인지 확인
@@ -2107,7 +2216,7 @@ async function isTileInCityCluster(gameId: number, tileId: number): Promise<bool
   const center = await db.select().from(hexTiles).where(eq(hexTiles.id, city.centerTileId)).then(rows => rows[0]);
   if (!center) return false;
 
-  const neighbors = await getNeighbors(center.q, center.r);
+  const neighbors = await getNeighbors(gameId, center.q, center.r);
   return neighbors.some(n => n.id === tileId);
 }
 
@@ -2244,10 +2353,18 @@ async function processBuildQueue(gameId: number, turn: number): Promise<void> {
 // 도시 성장 및 City Score 갱신
 async function updateCityGrowth(gameId: number) {
   const citiesInGame = await db.select().from(cities).where(eq(cities.gameId, gameId));
+
+  const [roomRow] = await db
+    .select({ turn: gameRooms.currentTurn })
+    .from(gameRooms)
+    .where(eq(gameRooms.id, gameId));
+  const turn = roomRow?.turn ?? 1;
+
+  const byOwner = new Map<number, Array<{ city: City; score: number }>>();
+
   for (const city of citiesInGame) {
     if (!city.ownerId) continue;
 
-    // GDD: City Score = (인구/1000) + (특산물/500) + (도시 등급 보너스)
     const specialtyTotal = await db
       .select({ sum: sql<number>`coalesce(sum(${specialties.amount}), 0)`.mapWith(Number) })
       .from(specialties)
@@ -2255,12 +2372,76 @@ async function updateCityGrowth(gameId: number) {
     const gradeBonus = city.grade === "capital" ? 50 : city.grade === "major" ? 30 : city.grade === "normal" ? 15 : 0;
     const cityScore = Math.floor((city.population ?? 0) / 1000) + Math.floor((specialtyTotal[0]?.sum ?? 0) / 500) + gradeBonus;
 
-    // TODO: City Score를 DB에 저장하거나 활용 (현재는 로그만)
-    console.log(`[CityGrowth] City ${city.name} score: ${cityScore}`);
+    const list = byOwner.get(city.ownerId) ?? [];
+    list.push({ city, score: cityScore });
+    byOwner.set(city.ownerId, list);
 
-    // 수도 이전 조건: 수도가 아닌 주요도시이고 CityScore가 80 이상이면 수도 이전 가능 (TODO: 플레이어 선택)
-    if (city.grade === "major" && cityScore >= 80) {
-      // TODO: 수도 이전 UI/이벤트 연동
+    if (city.grade === "town" && cityScore >= 20) {
+      await db.update(cities).set({ grade: "normal", isCapital: false }).where(eq(cities.id, city.id));
+      await db.insert(news).values({
+        gameId,
+        turn,
+        category: "city",
+        title: "도시 성장",
+        content: `${city.nameKo} 승격: 마을 → 일반도시`,
+        visibility: "global" satisfies NewsVisibilityDB,
+        involvedPlayerIds: [city.ownerId],
+      });
+    }
+
+    if (city.grade === "normal" && cityScore >= 45) {
+      await db.update(cities).set({ grade: "major", isCapital: false }).where(eq(cities.id, city.id));
+      await db.insert(news).values({
+        gameId,
+        turn,
+        category: "city",
+        title: "도시 성장",
+        content: `${city.nameKo} 승격: 일반도시 → 주요도시`,
+        visibility: "global" satisfies NewsVisibilityDB,
+        involvedPlayerIds: [city.ownerId],
+      });
+    }
+  }
+
+  for (const [ownerId, list] of Array.from(byOwner.entries())) {
+    const owned = list.slice().sort((a: { city: City; score: number }, b: { city: City; score: number }) => b.score - a.score);
+    if (owned.length === 0) continue;
+
+    const capitals = owned.filter((x: { city: City; score: number }) => x.city.grade === "capital" || x.city.isCapital);
+    const currentCapital = capitals[0]?.city ?? null;
+    const best = owned[0];
+
+    if (!currentCapital) {
+      await db.update(cities).set({ grade: "capital", isCapital: true }).where(eq(cities.id, best.city.id));
+      await db.insert(news).values({
+        gameId,
+        turn,
+        category: "city",
+        title: "수도 지정",
+        content: `${best.city.nameKo}이(가) 수도로 지정되었습니다.`,
+        visibility: "global" satisfies NewsVisibilityDB,
+        involvedPlayerIds: [ownerId],
+      });
+      continue;
+    }
+
+    for (const c of capitals.slice(1)) {
+      await db.update(cities).set({ grade: "major", isCapital: false }).where(eq(cities.id, c.city.id));
+    }
+
+    const capScore = owned.find((x: { city: City; score: number }) => x.city.id === currentCapital.id)?.score ?? 0;
+    if (best.city.id !== currentCapital.id && best.score >= 80 && best.score > capScore + 10) {
+      await db.update(cities).set({ grade: "major", isCapital: false }).where(eq(cities.id, currentCapital.id));
+      await db.update(cities).set({ grade: "capital", isCapital: true }).where(eq(cities.id, best.city.id));
+      await db.insert(news).values({
+        gameId,
+        turn,
+        category: "city",
+        title: "수도 이전",
+        content: `${best.city.nameKo}이(가) 새로운 수도로 지정되었습니다.`,
+        visibility: "global" satisfies NewsVisibilityDB,
+        involvedPlayerIds: [ownerId],
+      });
     }
   }
 }
