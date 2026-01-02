@@ -865,6 +865,29 @@ export default function Game() {
     });
   }, [roomId, toast]);
 
+  const selectedCity = useMemo<CityData | null>(() => {
+    if (!selectedTileId) return null;
+    const city = cities.find((c: City) => c.centerTileId === selectedTileId);
+    if (!city) return null;
+    const specialtyAmount = specialties.find((s) => s.cityId === city.id)?.amount ?? 0;
+    return {
+      id: String(city.id),
+      name: city.name,
+      nameKo: city.nameKo,
+      nationId: city.nationId ?? "",
+      ownerId: String(city.ownerId ?? ""),
+      population: city.population ?? 0,
+      grade: city.grade ?? "normal",
+      happiness: city.happiness ?? 0,
+      spyPower: city.spyPower ?? 0,
+      gold: city.gold ?? 0,
+      food: city.food ?? 0,
+      specialtyAmount,
+      centerTileId: String(city.centerTileId ?? ""),
+      taxRate: city.taxRate ?? 0,
+    };
+  }, [selectedTileId, cities, specialties]);
+
   const handleBuild = useCallback(() => {
     setBuildOpen(true);
   }, []);
@@ -1004,29 +1027,6 @@ export default function Game() {
     specialtyChange: currentPlayerIncome.specialtyPerTurn,
     specialtyType: currentPlayerSpecialty.typeLabel,
   };
-
-  const selectedCity = useMemo<CityData | null>(() => {
-    if (!selectedTileId) return null;
-    const city = cities.find((c: City) => c.centerTileId === selectedTileId);
-    if (!city) return null;
-    const specialtyAmount = specialties.find((s) => s.cityId === city.id)?.amount ?? 0;
-    return {
-      id: String(city.id),
-      name: city.name,
-      nameKo: city.nameKo,
-      nationId: city.nationId ?? "",
-      ownerId: String(city.ownerId ?? ""),
-      grade: city.grade,
-      population: city.population ?? 0,
-      happiness: city.happiness ?? 0,
-      spyPower: city.spyPower ?? 0,
-      gold: city.gold ?? 0,
-      food: city.food ?? 0,
-      specialtyAmount,
-      centerTileId: String(city.centerTileId ?? ""),
-      taxRate: city.taxRate ?? 0,
-    };
-  }, [selectedTileId, cities, specialties]);
 
   const selectedCityBuildings = useMemo<BuildingType[]>(() => {
     if (!selectedCity) return [];
