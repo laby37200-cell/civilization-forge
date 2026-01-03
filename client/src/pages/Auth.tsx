@@ -7,6 +7,7 @@ import { Label } from "@/components/ui/label";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { useToast } from "@/hooks/use-toast";
 import { apiRequest } from "@/lib/queryClient";
+import { queryClient } from "@/lib/queryClient";
 
 export default function Auth() {
   const [, setLocation] = useLocation();
@@ -30,10 +31,18 @@ export default function Auth() {
     setIsSubmitting(true);
     try {
       const url = mode === "login" ? "/api/auth/login" : "/api/auth/register";
-      await apiRequest("POST", url, {
+      const res = await apiRequest("POST", url, {
         username: username.trim(),
         password,
       });
+
+      const json = (await res.json()) as { user?: { id: number; username: string } };
+      if (json?.user?.id != null) {
+        queryClient.setQueryData(["/api/auth/me"], { user: json.user });
+      } else {
+        await queryClient.invalidateQueries({ queryKey: ["/api/auth/me"] });
+      }
+      await queryClient.invalidateQueries({ queryKey: ["/api/rooms"] });
 
       toast({
         title: mode === "login" ? "로그인 완료" : "회원가입 완료",

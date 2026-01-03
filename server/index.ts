@@ -6,6 +6,7 @@ import { createServer } from "http";
 import { setupWebSocket } from "./websocket";
 import session from "express-session";
 import MemoryStore from "memorystore";
+import path from "path";
 
 const app = express();
 const httpServer = createServer(app);
@@ -52,6 +53,8 @@ app.use(
 );
 
 app.use(express.urlencoded({ extended: false }));
+
+app.use("/texture", express.static(path.resolve(process.cwd(), "texture")));
 
 export function log(message: string, source = "express") {
   const formattedTime = new Date().toLocaleTimeString("en-US", {

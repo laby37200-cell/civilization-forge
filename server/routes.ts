@@ -254,11 +254,11 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
       const [room] = await db.insert(gameRooms).values({
         name: req.body.name || "새로운 게임",
         hostId: oderId,
-        maxPlayers: req.body.maxPlayers || 20,
+        maxPlayers: Math.min(req.body.maxPlayers || 10, 10),
         turnDuration: req.body.turnDuration || 45,
         victoryCondition: req.body.victoryCondition || "domination",
         mapMode: req.body.mapMode || "continents",
-        aiPlayerCount: req.body.aiPlayerCount || 0,
+        aiPlayerCount: 0,
         aiDifficulty: req.body.aiDifficulty || "normal",
         tradeExpireAfterTurns: req.body.tradeExpireAfterTurns || 3,
       }).returning();
@@ -419,6 +419,18 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
             ? ((t as any).fogOfWar as number[]).includes(viewerPlayerId)
             : false;
       const { fogOfWar: _fogOfWar, ...rest } = t as any;
+
+      if (!exploredForViewer && viewerPlayerId != null && !isSpectatorView) {
+        return {
+          ...rest,
+          ownerId: null,
+          cityId: null,
+          troops: 0,
+          specialtyType: null,
+          isExplored: false,
+        };
+      }
+
       return { ...rest, isExplored: exploredForViewer };
     });
 
@@ -430,14 +442,19 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
     }
 
     const visibleCityIds = new Set<number>();
+    // City visibility: if any tile belonging to that city is explored, the city is considered visible.
+    for (const t of tilesWithFog as any[]) {
+      if (!t?.isExplored) continue;
+      const cid = t.cityId as number | null | undefined;
+      if (cid != null) visibleCityIds.add(cid);
+    }
+
     const visibleNationIds = new Set<string>();
     for (const c of cityList) {
-      const centerTileId = (c as any).centerTileId as number | null | undefined;
-      if (centerTileId != null && visibleTileIds.has(centerTileId)) {
-        visibleCityIds.add((c as any).id as number);
-        if ((c as any).nationId) {
-          visibleNationIds.add(String((c as any).nationId));
-        }
+      const cityId = (c as any).id as number;
+      if (!visibleCityIds.has(cityId)) continue;
+      if ((c as any).nationId) {
+        visibleNationIds.add(String((c as any).nationId));
       }
     }
 
@@ -481,11 +498,26 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
       timestamp: n.createdAt ? new Date(n.createdAt).getTime() : Date.now(),
     }));
 
+    const nationNameById = new Map<string, string>();
+    for (const n of nationRows) {
+      const nid = String((n as any).nationId ?? "");
+      if (!nid) continue;
+      const label = String((n as any).nameKo ?? (n as any).name ?? nid);
+      nationNameById.set(nid, label);
+    }
+    for (const n of NationsInitialData) {
+      if (!nationNameById.has(n.id)) nationNameById.set(n.id, n.nameKo ?? n.name ?? n.id);
+    }
+
     const chatList = filteredChatRows.map((m) => ({
       id: String(m.id),
       roomId: String(roomId),
       senderId: String(m.senderId ?? ""),
-      senderName: String(players.find((p) => p.id === m.senderId)?.nationId ?? "-"),
+      senderName: (() => {
+        const nid = players.find((p) => p.id === m.senderId)?.nationId ?? null;
+        if (!nid) return "-";
+        return nationNameById.get(String(nid)) ?? String(nid);
+      })(),
       content: m.content,
       channel: (m.channel ?? "global") as any,
       targetId: m.targetId === null || m.targetId === undefined ? null : String(m.targetId),
@@ -668,13 +700,25 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
           );
 
         const revealIds = [city.centerTileId, ...neighbors.map((n) => n.id)];
+
+        const viewersToGrant = new Set<number>([player.id]);
+        if (player.nationId) {
+          const sameNation = await db
+            .select({ id: gamePlayers.id })
+            .from(gamePlayers)
+            .where(and(eq(gamePlayers.gameId, roomId), eq(gamePlayers.nationId, player.nationId)));
+          for (const r of sameNation) {
+            if (r.id != null) viewersToGrant.add(r.id);
+          }
+        }
+
         for (const tid of revealIds) {
           const [tile] = await db
             .select({ fogOfWar: hexTiles.fogOfWar })
             .from(hexTiles)
             .where(and(eq(hexTiles.gameId, roomId), eq(hexTiles.id, tid)));
           const existing = Array.isArray(tile?.fogOfWar) ? (tile.fogOfWar as number[]) : [];
-          const next = Array.from(new Set<number>([...existing, player.id]));
+          const next = Array.from(new Set<number>([...existing, ...Array.from(viewersToGrant.values())]));
           await db
             .update(hexTiles)
             .set({ fogOfWar: next })
@@ -837,7 +881,8 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
     const fromTileId = Number(req.body?.fromTileId);
     const targetTileId = Number(req.body?.targetTileId);
     const unitType = String(req.body?.unitType ?? "").trim() as any;
-    const amount = 100;
+    const rawAmount = Number(req.body?.amount);
+    const amount = Number.isFinite(rawAmount) && rawAmount > 0 ? Math.floor(rawAmount) : 100;
 
     if (!Number.isFinite(fromTileId) || !Number.isFinite(targetTileId)) {
       return res.status(400).json({ error: "Invalid tileId" });
@@ -1365,8 +1410,13 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
       .where(eq(gameRooms.id, roomId));
     const turn = roomRow?.turn ?? 1;
 
-    const tradeId = await proposeTrade(roomId, player.id, target.id, offer, request, turn);
-    res.json({ id: tradeId });
+    try {
+      const tradeId = await proposeTrade(roomId, player.id, target.id, offer, request, turn);
+      res.json({ id: tradeId });
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : "Invalid trade";
+      return res.status(400).json({ error: msg });
+    }
   });
 
   app.post("/api/rooms/:id/trades/:tradeId/respond", async (req, res) => {
@@ -1610,6 +1660,33 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
       return "plains";
     };
 
+    const getNationAnchor = (nationId: string | null): { nx: number; ny: number } | null => {
+      if (!nationId) return null;
+      const anchors: Record<string, { nx: number; ny: number }> = {
+        korea: { nx: 0.70, ny: 0.30 },
+        japan: { nx: 0.78, ny: 0.28 },
+        china: { nx: 0.65, ny: 0.30 },
+        russia: { nx: 0.58, ny: 0.20 },
+        thailand: { nx: 0.70, ny: 0.45 },
+        vietnam: { nx: 0.68, ny: 0.42 },
+        indonesia: { nx: 0.72, ny: 0.62 },
+        singapore_malaysia: { nx: 0.69, ny: 0.58 },
+        india: { nx: 0.56, ny: 0.45 },
+        pakistan: { nx: 0.52, ny: 0.42 },
+        turkey: { nx: 0.46, ny: 0.36 },
+        uae: { nx: 0.52, ny: 0.45 },
+        egypt: { nx: 0.40, ny: 0.42 },
+        uk: { nx: 0.38, ny: 0.22 },
+        france: { nx: 0.40, ny: 0.25 },
+        germany: { nx: 0.43, ny: 0.24 },
+        italy: { nx: 0.44, ny: 0.30 },
+        spain: { nx: 0.36, ny: 0.30 },
+        usa: { nx: 0.12, ny: 0.28 },
+        brazil: { nx: 0.22, ny: 0.62 },
+      };
+      return anchors[nationId] ?? null;
+    };
+
     const coords: Array<{ q: number; r: number }> = [];
     for (let r = 0; r < mapHeight; r++) {
       const offset = Math.floor(r / 2);
@@ -1651,7 +1728,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
       [0, 1],
     ];
 
-    const centerCandidates: Array<{ q: number; r: number; id: number; neighborIds: number[] }> = [];
+    const centerCandidates: Array<{ q: number; r: number; id: number; neighborIds: number[]; nx: number; ny: number }> = [];
     for (const c of coords) {
       const id = tileIdByCoord.get(`${c.q},${c.r}`);
       if (!id) continue;
@@ -1666,12 +1743,53 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
         neighborIds.push(nid);
       }
       if (!ok) continue;
-      centerCandidates.push({ q: c.q, r: c.r, id, neighborIds });
+
+      // 수도/도시는 반드시 바다 제외 (중심+주변 6타일 모두 육지)
+      const clusterCoords = [
+        { q: c.q, r: c.r },
+        ...directions.map(([dq, dr]) => ({ q: c.q + dq, r: c.r + dr })),
+      ];
+      const isLandCluster = clusterCoords.every((p) => getWorldMapTerrain(p.q, p.r, mapWidth, mapHeight) !== "sea");
+      if (!isLandCluster) continue;
+
+      const nx = (c.q + Math.floor(c.r / 2)) / mapWidth;
+      const ny = c.r / mapHeight;
+      centerCandidates.push({ q: c.q, r: c.r, id, neighborIds, nx, ny });
     }
 
     const gddCitiesAll = loadAppendixA_Cities();
-    const seatCount = Math.min(room.maxPlayers ?? 20, gddCitiesAll.length, centerCandidates.length);
-    const gddCities = gddCitiesAll.slice(0, seatCount);
+    const seatCount = Math.min(room.maxPlayers ?? 10, centerCandidates.length, 10);
+    const cityCountTarget = Math.min(gddCitiesAll.length, centerCandidates.length);
+    
+    const nationGroups = new Map<string, typeof gddCitiesAll>();
+    for (const city of gddCitiesAll) {
+      const nid = city.nationId;
+      if (!nationGroups.has(nid)) {
+        nationGroups.set(nid, []);
+      }
+      nationGroups.get(nid)!.push(city);
+    }
+    
+    const diverseCities: typeof gddCitiesAll = [];
+    const nationIds = Array.from(nationGroups.keys());
+    let nationIdx = 0;
+    
+    while (diverseCities.length < cityCountTarget && nationGroups.size > 0 && nationIds.length > 0) {
+      const nid = nationIds[nationIdx % nationIds.length];
+      const group = nationGroups.get(nid);
+      if (group && group.length > 0) {
+        const city = group.shift()!;
+        diverseCities.push(city);
+        if (group.length === 0) {
+          nationGroups.delete(nid);
+          const idx = nationIds.indexOf(nid);
+          if (idx >= 0) nationIds.splice(idx, 1);
+        }
+      }
+      nationIdx++;
+    }
+    
+    const gddCities = diverseCities;
     const [firstTurn] = await db
       .select({ turn: gameRooms.currentTurn })
       .from(gameRooms)
@@ -1697,14 +1815,56 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
       .returning({ id: cities.id, nationId: cities.nationId, grade: cities.grade, nameKo: cities.nameKo });
 
     const cityCount = Math.min(createdCities.length, centerCandidates.length);
-    const stride = Math.max(1, Math.floor(centerCandidates.length / cityCount));
 
+    const remaining = [...centerCandidates];
     const seatCities: Array<{ cityId: number; nationId: string; grade: CityGrade; centerTileId: number; clusterTileIds: number[] }> = [];
+
+    const axialDistance = (a: { q: number; r: number }, b: { q: number; r: number }) => {
+      const dq = a.q - b.q;
+      const dr = a.r - b.r;
+      return (Math.abs(dq) + Math.abs(dr) + Math.abs(dq + dr)) / 2;
+    };
+
+    const pickCandidate = (cityNationId: string | null, index: number) => {
+      if (remaining.length === 0) return null;
+      const anchor = getNationAnchor(cityNationId);
+      if (!anchor) {
+        const stride = Math.max(1, Math.floor(centerCandidates.length / Math.max(1, cityCount)));
+        const fallbackIndex = Math.min(remaining.length - 1, index * Math.max(1, Math.floor(stride / 2)));
+        return remaining[fallbackIndex] ?? remaining[0] ?? null;
+      }
+      let bestIdx = 0;
+      let bestScore = Number.POSITIVE_INFINITY;
+      for (let i = 0; i < remaining.length; i++) {
+        const c = remaining[i];
+        const dx = c.nx - anchor.nx;
+        const dy = c.ny - anchor.ny;
+        const score = dx * dx + dy * dy;
+        if (score < bestScore) {
+          bestScore = score;
+          bestIdx = i;
+        }
+      }
+      return remaining[bestIdx] ?? null;
+    };
 
     for (let i = 0; i < cityCount; i++) {
       const city = createdCities[i];
-      const pick = centerCandidates[i * stride] ?? centerCandidates[i];
+      const nationId = city.nationId ? String(city.nationId) : null;
+      const pick = pickCandidate(nationId, i);
       if (!pick) continue;
+
+      const pickIdx = remaining.findIndex((x) => x.id === pick.id);
+      if (pickIdx >= 0) remaining.splice(pickIdx, 1);
+
+      const minDist = 3;
+      for (let j = remaining.length - 1; j >= 0; j--) {
+        const cand = remaining[j];
+        if (axialDistance(cand, pick) < minDist) {
+          remaining.splice(j, 1);
+        }
+      }
+
       await db.update(cities).set({ centerTileId: pick.id }).where(eq(cities.id, city.id));
 
       const allTileIds = [pick.id, ...pick.neighborIds];
@@ -1745,68 +1905,18 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
       });
     }
 
-    const seatNationIds = Array.from(new Set(seatCities.map((c) => c.nationId)));
-    const nationRows = seatNationIds.length
-      ? await db
-          .select({ nationId: gameNations.nationId, color: gameNations.color })
-          .from(gameNations)
-          .where(and(eq(gameNations.gameId, roomId), inArray(gameNations.nationId, seatNationIds)))
-      : [];
-    const colorByNation = new Map<string, string>(nationRows.map((n) => [String(n.nationId), String(n.color)]));
-
-    const aiDifficulty = (room.aiDifficulty ?? "normal") as AIDifficulty;
-    const aiPlayerRows = seatCities.map((seat) => ({
+    // Create placeholder seat slots (AI placeholders) without owning cities.
+    // Humans claim an empty slot on join, then must select nation/city manually.
+    const seatSlots = Array.from({ length: seatCount }, () => ({
       gameId: roomId,
-      nationId: seat.nationId,
+      nationId: null,
       isAI: true,
-      aiDifficulty,
-      color: colorByNation.get(seat.nationId) ?? "#6b7280",
+      aiDifficulty: (room.aiDifficulty ?? "normal") as AIDifficulty,
+      color: "#6b7280",
     }));
 
-    if (aiPlayerRows.length > 0) {
-      const insertedAI = await db
-        .insert(gamePlayers)
-        .values(aiPlayerRows)
-        .returning({ id: gamePlayers.id });
-
-      const count = Math.min(insertedAI.length, seatCities.length);
-      for (let i = 0; i < count; i++) {
-        const aiPlayer = insertedAI[i];
-        const seat = seatCities[i];
-
-        await db.update(cities).set({ ownerId: aiPlayer.id }).where(eq(cities.id, seat.cityId));
-        await db.update(hexTiles)
-          .set({ ownerId: aiPlayer.id })
-          .where(and(eq(hexTiles.gameId, roomId), inArray(hexTiles.id, seat.clusterTileIds)));
-
-        const stats = CityGradeStats[seat.grade];
-        const initialTroops = stats.initialTroops;
-        await db.insert(units).values({
-          gameId: roomId,
-          tileId: seat.centerTileId,
-          cityId: seat.cityId,
-          ownerId: aiPlayer.id,
-          unitType: "infantry" satisfies UnitTypeDB,
-          count: initialTroops,
-        });
-
-        await db.update(hexTiles)
-          .set({ troops: initialTroops })
-          .where(eq(hexTiles.id, seat.centerTileId));
-
-        for (const tid of seat.clusterTileIds) {
-          const [tile] = await db
-            .select({ fogOfWar: hexTiles.fogOfWar })
-            .from(hexTiles)
-            .where(and(eq(hexTiles.gameId, roomId), eq(hexTiles.id, tid)));
-          const existingFog = Array.isArray(tile?.fogOfWar) ? (tile!.fogOfWar as number[]) : [];
-          const next = Array.from(new Set<number>([...existingFog, aiPlayer.id]));
-          await db
-            .update(hexTiles)
-            .set({ fogOfWar: next })
-            .where(and(eq(hexTiles.gameId, roomId), eq(hexTiles.id, tid)));
-        }
-      }
+    if (seatSlots.length > 0) {
+      await db.insert(gamePlayers).values(seatSlots);
     }
     
     console.log(`[seedRoom] Room ${roomId} initialization completed successfully`);

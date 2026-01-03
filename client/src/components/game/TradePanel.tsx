@@ -14,7 +14,7 @@ import { Badge } from "@/components/ui/badge";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { apiRequest } from "@/lib/queryClient";
 import { useToast } from "@/hooks/use-toast";
-import { SpecialtyStats } from "@shared/schema";
+import { NationsInitialData, SpecialtyStats } from "@shared/schema";
 import type { Trade, TradeStatus, GamePlayer, SpecialtyType, UnitTypeDB, City, Spy } from "@shared/schema";
 import { Checkbox } from "@/components/ui/checkbox";
 
@@ -26,9 +26,10 @@ interface TradePanelProps {
   spies: Spy[];
   myGold: number;
   myFood: number;
+  preselectTargetPlayerId?: number | null;
 }
 
-export function TradePanel({ roomId, currentPlayerId, players, cities, spies, myGold, myFood }: TradePanelProps) {
+export function TradePanel({ roomId, currentPlayerId, players, cities, spies, myGold, myFood, preselectTargetPlayerId }: TradePanelProps) {
   const [trades, setTrades] = useState<Trade[]>([]);
   const [roomTurn, setRoomTurn] = useState<number>(1);
   const [tradeExpireAfterTurns, setTradeExpireAfterTurns] = useState<number>(3);
@@ -71,6 +72,12 @@ export function TradePanel({ roomId, currentPlayerId, players, cities, spies, my
   const [requestCityId, setRequestCityId] = useState<number | null>(null);
   const [requestSpyId, setRequestSpyId] = useState<number | null>(null);
   const { toast } = useToast();
+
+  useEffect(() => {
+    if (preselectTargetPlayerId != null) {
+      setProposeTargetId(preselectTargetPlayerId);
+    }
+  }, [preselectTargetPlayerId]);
 
   const NONE_VALUE = "__none__";
 
@@ -154,16 +161,21 @@ export function TradePanel({ roomId, currentPlayerId, players, cities, spies, my
       return;
     }
 
-    if (
-      (offerGold === 0 && offerFood === 0 && offerSpecialtyAmount === 0 && offerUnitAmount === 0) ||
-      (requestGold === 0 && requestFood === 0 && requestSpecialtyAmount === 0 && requestUnitAmount === 0)
-    ) {
-      const offerHasExtra = Boolean(offerPeaceTreaty || offerShareVision || offerCityId != null || offerSpyId != null);
-      const requestHasExtra = Boolean(requestPeaceTreaty || requestShareVision || requestCityId != null || requestSpyId != null);
-      if (!offerHasExtra || !requestHasExtra) {
-        toast({ title: "제안과 요청에 자원을 넣어주세요", variant: "destructive" });
-        return;
-      }
+    const offerHasAny =
+      offerGold > 0 ||
+      offerFood > 0 ||
+      offerSpecialtyAmount > 0 ||
+      offerUnitAmount > 0 ||
+      Boolean(offerPeaceTreaty || offerShareVision || offerCityId != null || offerSpyId != null);
+    const requestHasAny =
+      requestGold > 0 ||
+      requestFood > 0 ||
+      requestSpecialtyAmount > 0 ||
+      requestUnitAmount > 0 ||
+      Boolean(requestPeaceTreaty || requestShareVision || requestCityId != null || requestSpyId != null);
+    if (!offerHasAny && !requestHasAny) {
+      toast({ title: "거래 제안/요청이 비어있습니다", variant: "destructive" });
+      return;
     }
 
     try {
@@ -327,7 +339,12 @@ export function TradePanel({ roomId, currentPlayerId, players, cities, spies, my
 
   const otherPlayers = players.filter((p) => p.id !== currentPlayerId && !p.isEliminated);
 
-  const playerLabel = (p: GamePlayer) => p.nationId || `Player ${p.id}`;
+  const playerLabel = (p: GamePlayer) => {
+    const nid = p.nationId ?? null;
+    if (!nid) return `Player ${p.id}`;
+    const nation = NationsInitialData.find((n) => n.id === nid) ?? null;
+    return nation?.nameKo ?? nation?.name ?? nid;
+  };
 
   const myCities = useMemo(() => cities.filter((c) => c.ownerId === currentPlayerId), [cities, currentPlayerId]);
   const targetCities = useMemo(() => (proposeTargetId != null ? cities.filter((c) => c.ownerId === proposeTargetId) : []), [cities, proposeTargetId]);

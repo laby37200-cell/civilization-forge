@@ -1,7 +1,25 @@
+import { GoogleGenAI } from "@google/genai";
 import { UnitStats, type UnitTypeDB } from "@shared/schema";
 
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
 const DEEPSEEK_API_KEY = process.env.DEEPSEEK_API_KEY;
+const REPLIT_GEMINI_API_KEY = process.env.AI_INTEGRATIONS_GEMINI_API_KEY;
+const REPLIT_GEMINI_BASE_URL = process.env.AI_INTEGRATIONS_GEMINI_BASE_URL;
+
+let replitGeminiClient: GoogleGenAI | null = null;
+function getReplitGeminiClient(): GoogleGenAI | null {
+  if (!REPLIT_GEMINI_API_KEY || !REPLIT_GEMINI_BASE_URL) return null;
+  if (!replitGeminiClient) {
+    replitGeminiClient = new GoogleGenAI({
+      apiKey: REPLIT_GEMINI_API_KEY,
+      httpOptions: {
+        apiVersion: "",
+        baseUrl: REPLIT_GEMINI_BASE_URL,
+      },
+    });
+  }
+  return replitGeminiClient;
+}
 
 // GDD 11장: 병과 상성 (가위바위보 시스템)
 // 보병 > 궁병 > 기병 > 보병
@@ -96,6 +114,35 @@ function getTerrainMultiplier(terrain: string, unitType: UnitTypeDB, side: "atta
     default:
       return 1.0;
   }
+}
+
+async function callReplitGeminiAPI(prompt: string): Promise<string | null> {
+  const client = getReplitGeminiClient();
+  if (!client) return null;
+  try {
+    const response = await client.models.generateContent({
+      model: "gemini-2.5-flash",
+      contents: [{ role: "user", parts: [{ text: prompt }] }],
+    });
+    const text = (response as any)?.text ?? (response as any)?.response?.text;
+    if (typeof text === "string" && text.trim()) return text;
+    const candidatesText = (response as any)?.candidates?.[0]?.content?.parts?.[0]?.text;
+    if (typeof candidatesText === "string" && candidatesText.trim()) return candidatesText;
+    return null;
+  } catch (error) {
+    console.error("[LLM] Replit Gemini API error:", error);
+    return null;
+  }
+}
+
+export async function generateChatResponse(prompt: string): Promise<string | null> {
+  const p = String(prompt ?? "").trim();
+  if (!p) return null;
+  let response = await callGeminiAPI(p);
+  if (!response) response = await callDeepseekAPI(p);
+  if (!response) response = await callReplitGeminiAPI(p);
+  const out = typeof response === "string" ? response.trim() : "";
+  return out ? out : null;
 }
 
 function calculateStatsScore(input: BattleInput): { attackerPower: number; defenderPower: number; statsScore: number } {

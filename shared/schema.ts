@@ -55,7 +55,7 @@ export const gameRooms = pgTable("game_rooms", {
   id: serial("id").primaryKey(),
   name: text("name").notNull(),
   hostId: integer("host_id").references(() => users.id),
-  maxPlayers: integer("max_players").default(20),
+  maxPlayers: integer("max_players").default(10),
   minPlayers: integer("min_players").default(2),
   turnDuration: integer("turn_duration").default(45),
   currentTurn: integer("current_turn").default(0),

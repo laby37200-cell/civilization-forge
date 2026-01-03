@@ -1,17 +1,23 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { Button } from "@/components/ui/button";
+import { Badge } from "@/components/ui/badge";
 import { Input } from "@/components/ui/input";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Avatar, AvatarFallback } from "@/components/ui/avatar";
 import { Send, Globe, Flag, Users, Lock } from "lucide-react";
 import type { ChatMessage, GamePlayer } from "@shared/schema";
+import { NationsInitialData } from "@shared/schema";
 
 interface ChatPanelProps {
   messages: ChatMessage[];
   currentPlayerId: string;
   players: GamePlayer[];
   onSendMessage: (content: string, channel: ChatMessage["channel"], targetId?: string | null) => void;
+  focusChannel?: ChatMessage["channel"] | null;
+  focusPrivateTargetId?: string | null;
+  unreadCounts?: Partial<Record<ChatMessage["channel"], number>>;
+  onViewChannel?: (channel: ChatMessage["channel"], privateTargetId?: string | null) => void;
 }
 
 function MessageBubble({ message, isOwn }: { message: ChatMessage; isOwn: boolean }) {
@@ -27,7 +33,7 @@ function MessageBubble({ message, isOwn }: { message: ChatMessage; isOwn: boolea
         <div
           className={`px-3 py-2 rounded-md text-sm ${
             isOwn ? "bg-primary text-primary-foreground" : "bg-muted"
-          }`}
+          } break-words whitespace-pre-wrap`}
         >
           {message.content}
         </div>
@@ -36,10 +42,29 @@ function MessageBubble({ message, isOwn }: { message: ChatMessage; isOwn: boolea
   );
 }
 
-export function ChatPanel({ messages, currentPlayerId, players, onSendMessage }: ChatPanelProps) {
+export function ChatPanel({ messages, currentPlayerId, players, onSendMessage, focusChannel, focusPrivateTargetId, unreadCounts, onViewChannel }: ChatPanelProps) {
   const [input, setInput] = useState("");
   const [activeChannel, setActiveChannel] = useState<ChatMessage["channel"]>("global");
   const [privateTargetId, setPrivateTargetId] = useState<string>("");
+
+  useEffect(() => {
+    if (focusChannel) {
+      setActiveChannel(focusChannel);
+    }
+    if (focusPrivateTargetId != null && focusPrivateTargetId !== "") {
+      setPrivateTargetId(focusPrivateTargetId);
+    }
+  }, [focusChannel, focusPrivateTargetId]);
+
+  useEffect(() => {
+    if (!onViewChannel) return;
+    if (activeChannel === "private") {
+      if (!privateTargetId) return;
+      onViewChannel(activeChannel, privateTargetId);
+      return;
+    }
+    onViewChannel(activeChannel, null);
+  }, [activeChannel, privateTargetId, onViewChannel]);
 
   const filteredMessages = messages.filter((m) => {
     if (m.channel !== activeChannel) return false;
@@ -74,6 +99,12 @@ export function ChatPanel({ messages, currentPlayerId, players, onSendMessage }:
   };
 
   const privateTargets = players.filter((p: GamePlayer) => String(p.id) !== currentPlayerId);
+  const labelForPlayer = (p: GamePlayer): string => {
+    const nid = p.nationId ?? null;
+    if (!nid) return `Player ${p.id}`;
+    const nation = NationsInitialData.find((n) => n.id === nid) ?? null;
+    return nation?.nameKo ?? nation?.name ?? nid;
+  };
 
   return (
     <div className="h-full flex flex-col bg-card rounded-md border" data-testid="chat-panel">
@@ -88,36 +119,64 @@ export function ChatPanel({ messages, currentPlayerId, players, onSendMessage }:
             className="rounded-none border-b-2 border-transparent data-[state=active]:border-primary"
             data-testid="tab-chat-global"
           >
-            <Globe className="w-4 h-4 mr-1" />
-            전체
+            <div className="relative inline-flex items-center">
+              <Globe className="w-4 h-4 mr-1" />
+              전체
+              {(unreadCounts?.global ?? 0) > 0 && (
+                <Badge className="ml-2 h-4 min-w-4 px-1 flex items-center justify-center text-[10px] leading-none">
+                  {unreadCounts?.global}
+                </Badge>
+              )}
+            </div>
           </TabsTrigger>
           <TabsTrigger
             value="nation"
             className="rounded-none border-b-2 border-transparent data-[state=active]:border-primary"
             data-testid="tab-chat-nation"
           >
-            <Flag className="w-4 h-4 mr-1" />
-            국가
+            <div className="relative inline-flex items-center">
+              <Flag className="w-4 h-4 mr-1" />
+              국가
+              {(unreadCounts?.nation ?? 0) > 0 && (
+                <Badge className="ml-2 h-4 min-w-4 px-1 flex items-center justify-center text-[10px] leading-none">
+                  {unreadCounts?.nation}
+                </Badge>
+              )}
+            </div>
           </TabsTrigger>
           <TabsTrigger
             value="alliance"
             className="rounded-none border-b-2 border-transparent data-[state=active]:border-primary"
             data-testid="tab-chat-alliance"
           >
-            <Users className="w-4 h-4 mr-1" />
-            동맹
+            <div className="relative inline-flex items-center">
+              <Users className="w-4 h-4 mr-1" />
+              동맹
+              {(unreadCounts?.alliance ?? 0) > 0 && (
+                <Badge className="ml-2 h-4 min-w-4 px-1 flex items-center justify-center text-[10px] leading-none">
+                  {unreadCounts?.alliance}
+                </Badge>
+              )}
+            </div>
           </TabsTrigger>
           <TabsTrigger
             value="private"
             className="rounded-none border-b-2 border-transparent data-[state=active]:border-primary"
             data-testid="tab-chat-private"
           >
-            <Lock className="w-4 h-4 mr-1" />
-            1:1
+            <div className="relative inline-flex items-center">
+              <Lock className="w-4 h-4 mr-1" />
+              1:1
+              {(unreadCounts?.private ?? 0) > 0 && (
+                <Badge className="ml-2 h-4 min-w-4 px-1 flex items-center justify-center text-[10px] leading-none">
+                  {unreadCounts?.private}
+                </Badge>
+              )}
+            </div>
           </TabsTrigger>
         </TabsList>
 
-        <TabsContent value={activeChannel} className="flex-1 m-0 min-h-0">
+        <TabsContent value={activeChannel} className="flex-1 m-0 min-h-0 flex flex-col">
           {activeChannel === "private" && (
             <div className="p-2 border-b">
               <div className="text-xs text-muted-foreground mb-1">대화 상대</div>
@@ -129,7 +188,7 @@ export function ChatPanel({ messages, currentPlayerId, players, onSendMessage }:
                 <option value="">선택</option>
                 {privateTargets.map((p) => (
                   <option key={p.id} value={String(p.id)}>
-                    {p.nationId || `Player ${p.id}`}
+                    {labelForPlayer(p)}
                   </option>
                 ))}
               </select>

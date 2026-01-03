@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useLocation, useRoute } from "wouter";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
@@ -14,6 +14,7 @@ import {
   MessageSquare,
   Settings,
   LogOut,
+  Trash2,
 } from "lucide-react";
 import { TurnTimer } from "@/components/game/TurnTimer";
 import { ResourceBar } from "@/components/game/ResourceBar";
@@ -71,13 +72,80 @@ import type {
   GameNation,
   AutoMove,
 } from "@shared/schema";
-import { NationsInitialData, SpecialtyStats, CityGradeStats, UnitStats, BuildingStats } from "@shared/schema";
+import { NationsInitialData, SpecialtyStats, CityGradeStats, UnitStats, BuildingStats, TerrainStats } from "@shared/schema";
 
 
 const mockDiplomacy: DiplomacyData[] = [
   { playerId1: "player1", playerId2: "player2", status: "neutral", favorability: 10 },
   { playerId1: "player1", playerId2: "ai1", status: "hostile", favorability: -25 },
 ];
+
+const hexDirs: Array<[number, number]> = [
+  [1, 0],
+  [1, -1],
+  [0, -1],
+  [-1, 0],
+  [-1, 1],
+  [0, 1],
+];
+
+const textureUrl = (rel: string) => encodeURI(`/texture/${rel}`);
+
+function canMoveUnit(unitType: UnitType, fromTerrain: HexTile["terrain"], toTerrain: HexTile["terrain"]): boolean {
+  if (unitType === "spy") return false;
+  if (unitType === "siege" && toTerrain === "mountain") return false;
+
+  if (unitType === "navy") {
+    if (fromTerrain !== "sea" && toTerrain !== "sea") return false;
+  } else {
+    if (toTerrain === "sea") return false;
+  }
+
+  return true;
+}
+
+function unitMovePoints(unitType: UnitType): number {
+  switch (unitType) {
+    case "infantry":
+      return 3;
+    case "cavalry":
+      return 5;
+    case "archer":
+      return 3;
+    case "siege":
+      return 2;
+    case "navy":
+      return 3;
+    case "spy":
+      return 4;
+    default:
+      return 3;
+  }
+}
+
+function buildQuickMoveUnits(available: TroopData): TroopData | null {
+  const movable: Array<[UnitType, number]> = (Object.entries(available) as Array<[UnitType, number]>).filter(
+    ([t, v]) => t !== "spy" && (v ?? 0) > 0
+  );
+  const totalMovable = movable.reduce((s, [, v]) => s + (v ?? 0), 0);
+  if (totalMovable <= 0) return null;
+
+  const target = totalMovable;
+  movable.sort((a, b) => (b[1] ?? 0) - (a[1] ?? 0));
+
+  const out: TroopData = { infantry: 0, cavalry: 0, archer: 0, siege: 0, navy: 0, spy: 0 };
+  let remaining = target;
+  for (const [t, v] of movable) {
+    if (remaining <= 0) break;
+    const take = Math.min(remaining, v ?? 0);
+    out[t] = take;
+    remaining -= take;
+  }
+
+  const sum = (Object.entries(out) as Array<[UnitType, number]>).reduce((s, [t, v]) => s + (t === "spy" ? 0 : (v ?? 0)), 0);
+  if (sum !== target) return null;
+  return out;
+}
 
 export default function Game() {
   const { toast } = useToast();
@@ -106,12 +174,31 @@ export default function Game() {
   const [activeTab, setActiveTab] = useState("map");
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [news, setNews] = useState<NewsItem[]>([]);
+
+  const [lastViewedChatAt, setLastViewedChatAt] = useState(() => ({
+    global: Date.now(),
+    nation: Date.now(),
+    alliance: Date.now(),
+  }));
+  const [lastViewedPrivateAt, setLastViewedPrivateAt] = useState<Record<string, number>>(() => ({}));
+  const currentViewedChatRef = useRef<{ channel: ChatMessage["channel"]; privateTargetId: string | null } | null>(null);
+  const newsRefetchTimeoutRef = useRef<number | null>(null);
+
+  const [tradeTargetPlayerId, setTradeTargetPlayerId] = useState<number | null>(null);
+  const [chatFocus, setChatFocus] = useState<{ channel: ChatMessage["channel"]; targetId: string } | null>(null);
+
+  const [quickMove, setQuickMove] = useState<{ fromTileId: number; units: TroopData } | null>(null);
+  const [quickMoveDialogOpen, setQuickMoveDialogOpen] = useState(false);
+  const [quickMoveDraftFromTileId, setQuickMoveDraftFromTileId] = useState<number | null>(null);
+  const [quickMoveDraftUnitType, setQuickMoveDraftUnitType] = useState<UnitType>("infantry");
+  const [quickMoveDraftAmount, setQuickMoveDraftAmount] = useState<number>(100);
   const [battleOpen, setBattleOpen] = useState(false);
   const [currentBattle, setCurrentBattle] = useState<BattleData | null>(null);
   const [battleIsAttacker, setBattleIsAttacker] = useState(true);
 
   const [currentUser, setCurrentUser] = useState<{ id: number; username: string } | null>(null);
   const [players, setPlayers] = useState<GamePlayer[]>([]);
+  const [roomHostId, setRoomHostId] = useState<number | null>(null);
 
   const [nationSelectOpen, setNationSelectOpen] = useState(false);
   const [citySelectOpen, setCitySelectOpen] = useState(false);
@@ -191,8 +278,11 @@ export default function Game() {
 
   const [autoMoveArmed, setAutoMoveArmed] = useState(false);
   const [autoMoveUnitType, setAutoMoveUnitType] = useState<UnitType>("infantry");
+  const [autoMoveAmount, setAutoMoveAmount] = useState<number>(100);
   const [autoMoveFromTileId, setAutoMoveFromTileId] = useState<number | null>(null);
   const [autoMoveTargetTileId, setAutoMoveTargetTileId] = useState<number | null>(null);
+
+  const [unitFacingByTileId, setUnitFacingByTileId] = useState<Record<number, 1 | -1>>({});
 
   const cancelAutoMove = useCallback(async (autoMoveId: number) => {
     if (!roomId) return;
@@ -212,18 +302,19 @@ export default function Game() {
     }
   }, [roomId, loadAutoMoves, toast]);
 
-  const createAutoMove = useCallback(async (fromTileId: number, targetTileId: number, unitType: UnitType) => {
+  const createAutoMove = useCallback(async (fromTileId: number, targetTileId: number, unitType: UnitType, amount: number) => {
     if (!roomId) return;
     try {
       await apiRequest("POST", `/api/rooms/${roomId}/auto_moves`, {
         fromTileId,
         targetTileId,
         unitType,
+        amount,
       });
       await loadAutoMoves();
       toast({
         title: "자동이동 추가",
-        description: `자동이동이 등록되었습니다. (${unitLabels[unitType]} 100)`
+        description: `자동이동이 등록되었습니다. (${unitLabels[unitType]} ${amount})`
       });
     } catch (e: any) {
       toast({
@@ -332,7 +423,7 @@ export default function Game() {
 
         const roomRes = await apiRequest("GET", `/api/rooms/${roomId}`);
         const roomJson = (await roomRes.json()) as {
-          room: { turnDuration: number | null; currentTurn: number | null; turnEndTime: number | null };
+          room: { hostId?: number | null; turnDuration: number | null; currentTurn: number | null; turnEndTime: number | null };
           players: GamePlayer[];
           nations?: GameNation[];
           cities: City[];
@@ -361,6 +452,7 @@ export default function Game() {
         setCurrentTurn(roomJson.room?.currentTurn ?? 1);
         const nextTurnEndTime = roomJson.room?.turnEndTime ?? null;
         setTurnEndTime(nextTurnEndTime);
+        setRoomHostId(typeof roomJson.room?.hostId === "number" ? roomJson.room.hostId : null);
 
         if (nextTurnEndTime) {
           const diff = Math.ceil((nextTurnEndTime - Date.now()) / 1000);
@@ -396,6 +488,52 @@ export default function Game() {
     if (!currentUser) return null;
     return players.find((p) => p.oderId === currentUser.id) ?? null;
   }, [players, currentUser]);
+
+  const handleViewChatChannel = useCallback((channel: ChatMessage["channel"], privateTargetId?: string | null) => {
+    const now = Date.now();
+    currentViewedChatRef.current = { channel, privateTargetId: privateTargetId ?? null };
+    if (channel === "private") {
+      if (!privateTargetId) return;
+      setLastViewedPrivateAt((prev) => ({ ...prev, [String(privateTargetId)]: now }));
+      return;
+    }
+    setLastViewedChatAt((prev) => ({ ...prev, [channel]: now }));
+  }, []);
+
+  const myPlayerIdStr = useMemo(() => String(currentPlayer?.id ?? ""), [currentPlayer]);
+
+  const unreadCounts = useMemo<Partial<Record<ChatMessage["channel"], number>>>(() => {
+    if (!myPlayerIdStr) return { global: 0, nation: 0, alliance: 0, private: 0 };
+
+    let global = 0;
+    let nation = 0;
+    let alliance = 0;
+    let priv = 0;
+
+    for (const m of messages) {
+      if (m.senderId === myPlayerIdStr) continue;
+      const ts = Number(m.timestamp ?? 0);
+
+      if (m.channel === "global") {
+        if (ts > (lastViewedChatAt.global ?? 0)) global += 1;
+      } else if (m.channel === "nation") {
+        if (ts > (lastViewedChatAt.nation ?? 0)) nation += 1;
+      } else if (m.channel === "alliance") {
+        if (ts > (lastViewedChatAt.alliance ?? 0)) alliance += 1;
+      } else if (m.channel === "private") {
+        const otherId = m.senderId === myPlayerIdStr ? (m.targetId ?? "") : m.senderId;
+        if (!otherId) continue;
+        const last = lastViewedPrivateAt[otherId] ?? (lastViewedChatAt.global ?? 0);
+        if (ts > last) priv += 1;
+      }
+    }
+
+    return { global, nation, alliance, private: priv };
+  }, [messages, myPlayerIdStr, lastViewedChatAt, lastViewedPrivateAt]);
+
+  const totalUnreadChat = useMemo(() => {
+    return (unreadCounts.global ?? 0) + (unreadCounts.nation ?? 0) + (unreadCounts.alliance ?? 0) + (unreadCounts.private ?? 0);
+  }, [unreadCounts]);
 
   const pendingDiplomacyCount = useMemo(() => {
     const myId = currentPlayer?.id;
@@ -519,6 +657,131 @@ export default function Game() {
     return NationsInitialData.find((n) => n.id === currentPlayer.nationId) ?? null;
   }, [currentPlayer, nations]);
 
+  const nationLabelById = useMemo(() => {
+    const m = new Map<string, string>();
+    for (const n of nations) {
+      if (!n.nationId) continue;
+      m.set(String(n.nationId), n.nameKo ?? n.name ?? String(n.nationId));
+    }
+    for (const n of NationsInitialData) {
+      if (!m.has(n.id)) m.set(n.id, n.nameKo ?? n.name ?? n.id);
+    }
+    return m;
+  }, [nations]);
+
+  const friendlyPlayerIds = useMemo(() => {
+    const me = currentPlayer?.id ?? null;
+    if (!me) return [];
+    const out = new Set<number>([me]);
+
+    const myNationId = currentPlayer?.nationId ?? null;
+    if (myNationId) {
+      for (const p of players) {
+        if (p.id && p.nationId && p.nationId === myNationId) out.add(p.id);
+      }
+    }
+
+    for (const d of diplomacy) {
+      if (d.status !== "alliance") continue;
+      const a = Number(d.playerId1);
+      const b = Number(d.playerId2);
+      if (!Number.isFinite(a) || !Number.isFinite(b)) continue;
+      if (a === me) out.add(b);
+      if (b === me) out.add(a);
+    }
+
+    return Array.from(out);
+  }, [currentPlayer, players, diplomacy]);
+
+  const atWarPlayerIds = useMemo(() => {
+    const me = currentPlayer?.id ?? null;
+    if (!me) return [];
+    const out = new Set<number>();
+    for (const d of diplomacy) {
+      if (d.status !== "war") continue;
+      const a = Number(d.playerId1);
+      const b = Number(d.playerId2);
+      if (!Number.isFinite(a) || !Number.isFinite(b)) continue;
+      if (a === me) out.add(b);
+      if (b === me) out.add(a);
+    }
+    return Array.from(out);
+  }, [currentPlayer, diplomacy]);
+
+  const quickMoveReachableTileIds = useMemo(() => {
+    const me = currentPlayer?.id ?? null;
+    if (!quickMove || !me) return [];
+
+    const from = tiles.find((t) => t.id === quickMove.fromTileId) ?? null;
+    if (!from) return [];
+
+    const includedTypes = (Object.entries(quickMove.units) as Array<[UnitType, number]>)
+      .filter(([t, v]) => t !== "spy" && (v ?? 0) > 0)
+      .map(([t]) => t);
+    if (includedTypes.length === 0) return [];
+
+    let groupMP = Infinity;
+    for (const t of includedTypes) {
+      groupMP = Math.min(groupMP, unitMovePoints(t));
+    }
+    if (!Number.isFinite(groupMP)) return [];
+
+    const idByCoord = new Map<string, number>();
+    const tileById = new Map<number, HexTile>();
+    for (const t of tiles) {
+      idByCoord.set(`${t.q},${t.r}`, t.id);
+      tileById.set(t.id, t);
+    }
+
+    const friendlySet = new Set<number>(friendlyPlayerIds);
+    const atWarSet = new Set<number>(atWarPlayerIds);
+
+    const dist = new Map<number, number>();
+    const q: number[] = [];
+    dist.set(from.id, 0);
+    q.push(from.id);
+
+    while (q.length > 0) {
+      const curId = q.shift()!;
+      const cur = tileById.get(curId);
+      if (!cur) continue;
+      const curCost = dist.get(curId) ?? 0;
+
+      for (const [dq, dr] of hexDirs) {
+        const nid = idByCoord.get(`${cur.q + dq},${cur.r + dr}`);
+        if (nid == null) continue;
+        const nxt = tileById.get(nid);
+        if (!nxt) continue;
+
+        if (nxt.ownerId != null && nxt.ownerId !== me) {
+          if (!friendlySet.has(nxt.ownerId) && !atWarSet.has(nxt.ownerId)) continue;
+        }
+
+        let ok = true;
+        for (const ut of includedTypes) {
+          if (!canMoveUnit(ut, cur.terrain, nxt.terrain)) {
+            ok = false;
+            break;
+          }
+        }
+        if (!ok) continue;
+
+        const stepCost = TerrainStats[nxt.terrain]?.moveCost ?? 1;
+        const nextCost = curCost + stepCost;
+        if (nextCost > groupMP + 1e-6) continue;
+
+        const prev = dist.get(nid);
+        if (prev == null || nextCost < prev) {
+          dist.set(nid, nextCost);
+          q.push(nid);
+        }
+      }
+    }
+
+    dist.delete(from.id);
+    return Array.from(dist.keys());
+  }, [quickMove, currentPlayer, tiles, friendlyPlayerIds, atWarPlayerIds]);
+
   const playerColor = playerNation?.color ?? "#1E90FF";
 
   const myCities = useMemo(() => {
@@ -551,7 +814,7 @@ export default function Game() {
     if (!roomId) return;
     const roomRes = await apiRequest("GET", `/api/rooms/${roomId}`);
     const roomJson = (await roomRes.json()) as {
-      room: { turnDuration: number | null; currentTurn: number | null; turnEndTime: number | null };
+      room: { hostId?: number | null; turnDuration: number | null; currentTurn: number | null; turnEndTime: number | null };
       players: GamePlayer[];
       nations?: GameNation[];
       cities: City[];
@@ -568,6 +831,7 @@ export default function Game() {
     setTurnDuration(nextTurnDuration);
     setCurrentTurn(roomJson.room?.currentTurn ?? 1);
     setTurnEndTime(roomJson.room?.turnEndTime ?? null);
+    setRoomHostId(typeof roomJson.room?.hostId === "number" ? roomJson.room.hostId : null);
     setTiles(roomJson.tiles ?? []);
     setCities(roomJson.cities ?? []);
     setPlayers(roomJson.players ?? []);
@@ -586,6 +850,18 @@ export default function Game() {
     await loadAutoMoves();
     await loadBattlefields();
   }, [roomId, loadDiplomacy, loadPendingTradeCount, loadIncomingAttacks, loadAutoMoves, loadBattlefields]);
+
+  const handleDeleteRoom = useCallback(async () => {
+    if (!roomId) return;
+    if (!window.confirm("정말 이 방을 삭제할까요? 방의 모든 데이터가 삭제됩니다.")) return;
+    try {
+      await apiRequest("DELETE", `/api/rooms/${roomId}`);
+      toast({ title: "방 삭제 완료" });
+      setLocation("/");
+    } catch (e: any) {
+      toast({ title: "방 삭제 실패", description: e?.message || "오류가 발생했습니다.", variant: "destructive" });
+    }
+  }, [roomId, setLocation, toast]);
 
   useEffect(() => {
     if (!roomId || !currentPlayer) return;
@@ -668,8 +944,9 @@ export default function Game() {
       targetId?: number | null;
       timestamp: number;
     }) => {
+      const msgKey = `${payload.timestamp}:${payload.senderPlayerId}:${payload.channel}:${payload.targetId ?? ""}`;
       const m: ChatMessage = {
-        id: String(payload.timestamp),
+        id: msgKey,
         roomId: String(rid),
         senderId: String(payload.senderPlayerId),
         senderName: payload.senderName ?? "-",
@@ -679,6 +956,19 @@ export default function Game() {
         timestamp: payload.timestamp,
       };
       setMessages((prev: ChatMessage[]) => (prev.some((x) => x.id === m.id) ? prev : [...prev, m]));
+
+      const view = currentViewedChatRef.current;
+      const isFromOther = String(payload.senderPlayerId) !== myPlayerIdStr;
+      if (!view || !isFromOther) return;
+
+      if (view.channel !== m.channel) return;
+      if (m.channel === "private") {
+        const otherId = m.senderId;
+        if (!view.privateTargetId || view.privateTargetId !== otherId) return;
+        setLastViewedPrivateAt((prev) => ({ ...prev, [otherId]: Math.max(prev[otherId] ?? 0, payload.timestamp) }));
+        return;
+      }
+      setLastViewedChatAt((prev) => ({ ...prev, [m.channel]: Math.max((prev as any)[m.channel] ?? 0, payload.timestamp) }));
     };
 
     const onNationSelected = (payload: { oderId: number; nationId: string; color: string }) => {
@@ -764,6 +1054,14 @@ export default function Game() {
       };
 
       setNews((prev) => (prev.some((x) => x.id === item.id) ? prev : [item, ...prev].slice(0, 50)));
+
+      if (newsRefetchTimeoutRef.current != null) {
+        window.clearTimeout(newsRefetchTimeoutRef.current);
+      }
+      newsRefetchTimeoutRef.current = window.setTimeout(() => {
+        newsRefetchTimeoutRef.current = null;
+        refetchRoomState();
+      }, 150);
     };
 
     const onResourceUpdate = (payload: { playerId: number; goldChange: number; foodChange: number }) => {
@@ -798,6 +1096,10 @@ export default function Game() {
     socket.on("room_deleted", onRoomDeleted);
 
     return () => {
+      if (newsRefetchTimeoutRef.current != null) {
+        window.clearTimeout(newsRefetchTimeoutRef.current);
+        newsRefetchTimeoutRef.current = null;
+      }
       socket.off("game_start", onGameStart);
       socket.off("turn_end", onTurnEnd);
       socket.off("chat_message", onChatMessage);
@@ -813,6 +1115,31 @@ export default function Game() {
     };
   }, [roomId, currentUser, players, currentTurn, currentPlayer, refetchRoomState, toast]);
 
+  const quickMoveDraftOptions = useMemo(() => {
+    const me = currentPlayer?.id ?? null;
+    if (!me || !quickMoveDraftFromTileId) return [] as UnitType[];
+    const troops = getTroopsForTile(quickMoveDraftFromTileId, me);
+    return (Object.entries(troops) as Array<[UnitType, number]>)
+      .filter(([t, v]) => t !== "spy" && (v ?? 0) > 0)
+      .map(([t]) => t);
+  }, [currentPlayer, quickMoveDraftFromTileId, getTroopsForTile]);
+
+  const quickMoveDraftAvailable = useMemo(() => {
+    const me = currentPlayer?.id ?? null;
+    if (!me || !quickMoveDraftFromTileId) return 0;
+    const troops = getTroopsForTile(quickMoveDraftFromTileId, me);
+    return Math.max(0, Math.floor(Number((troops as any)[quickMoveDraftUnitType] ?? 0)));
+  }, [currentPlayer, quickMoveDraftFromTileId, quickMoveDraftUnitType, getTroopsForTile]);
+
+  useEffect(() => {
+    setQuickMoveDraftAmount((prev) => {
+      const max = Math.max(0, Math.floor(Number(quickMoveDraftAvailable ?? 0)));
+      if (max <= 0) return 1;
+      const n = Math.floor(Number(prev) || 1);
+      return Math.max(1, Math.min(max, n));
+    });
+  }, [quickMoveDraftAvailable]);
+
   useEffect(() => {
     const timer = setInterval(() => {
       setTimeRemaining(() => {
@@ -825,11 +1152,45 @@ export default function Game() {
     return () => clearInterval(timer);
   }, [turnEndTime, turnDuration]);
 
+  const submitTurnAction = useCallback((actionType: string, actionData: unknown) => {
+    const rid = roomId;
+    if (!rid) return;
+    const socket = getSocket();
+    socket.emit("turn_action", { roomId: rid, actionType, actionData });
+    toast({
+      title: "행동 제출됨",
+      description: `${actionType} 행동이 턴 종료 시 처리됩니다.`,
+    });
+  }, [roomId, toast]);
+
   const handleTileClick = useCallback((tileId: number) => {
+    const me = currentPlayer?.id ?? null;
+    if (quickMove && tileId === quickMove.fromTileId) {
+      setSelectedTileId(tileId);
+      setQuickMove(null);
+      return;
+    }
+    if (quickMove && tileId !== quickMove.fromTileId) {
+      if (quickMoveReachableTileIds.includes(tileId)) {
+        const from = tiles.find((t) => t.id === quickMove.fromTileId) ?? null;
+        const to = tiles.find((t) => t.id === tileId) ?? null;
+        const axFrom = from ? from.q + from.r / 2 : 0;
+        const axTo = to ? to.q + to.r / 2 : 0;
+        const facing = axTo < axFrom ? (-1 as const) : (1 as const);
+        setUnitFacingByTileId((prev) => ({ ...prev, [tileId]: facing }));
+        submitTurnAction("move", { fromTileId: quickMove.fromTileId, toTileId: tileId, units: quickMove.units });
+        setSelectedTileId(tileId);
+        setQuickMove(null);
+        return;
+      }
+    }
     if (autoMoveArmed && autoMoveFromTileId != null) {
       if (tileId !== autoMoveFromTileId) {
         setAutoMoveTargetTileId(tileId);
-        createAutoMove(autoMoveFromTileId, tileId, autoMoveUnitType);
+        const available = getTroopsForTile(autoMoveFromTileId, me);
+        const maxAvail = Math.max(0, Math.floor(Number((available as any)[autoMoveUnitType] ?? 0)));
+        const amt = Math.max(1, Math.min(maxAvail, Math.floor(Number(autoMoveAmount) || 1)));
+        createAutoMove(autoMoveFromTileId, tileId, autoMoveUnitType, amt);
         setAutoMoveArmed(false);
         return;
       }
@@ -839,7 +1200,35 @@ export default function Game() {
       return;
     }
     setSelectedTileId(tileId);
-  }, [autoMoveArmed, autoMoveFromTileId, autoMoveUnitType, createAutoMove, moveOpen, attackOpen, actionFromTileId]);
+  }, [quickMove, quickMoveReachableTileIds, tiles, submitTurnAction, autoMoveArmed, autoMoveFromTileId, autoMoveUnitType, autoMoveAmount, createAutoMove, moveOpen, attackOpen, actionFromTileId, getTroopsForTile, currentPlayer]);
+
+  const handleUnitClick = useCallback((tileId: number) => {
+    const me = currentPlayer?.id ?? null;
+    if (!me) return;
+
+    setSelectedTileId(tileId);
+    setQuickMove(null);
+
+    const available = getTroopsForTile(tileId, me);
+    const movable: Array<[UnitType, number]> = (Object.entries(available) as Array<[UnitType, number]>).filter(
+      ([t, v]) => t !== "spy" && (v ?? 0) > 0
+    );
+    if (movable.length === 0) {
+      toast({ title: "이동할 병력이 없습니다", variant: "destructive" });
+      setQuickMove(null);
+      setQuickMoveDialogOpen(false);
+      return;
+    }
+
+    movable.sort((a, b) => (b[1] ?? 0) - (a[1] ?? 0));
+    const bestType = movable[0][0];
+    const bestAvail = Math.max(0, Math.floor(Number(movable[0][1] ?? 0)));
+
+    setQuickMoveDraftFromTileId(tileId);
+    setQuickMoveDraftUnitType(bestType);
+    setQuickMoveDraftAmount(Math.max(1, Math.min(bestAvail, 100)));
+    setQuickMoveDialogOpen(true);
+  }, [currentPlayer, getTroopsForTile, toast]);
 
   const handleSendMessage = useCallback((content: string, channel: ChatMessage["channel"], targetId?: string | null) => {
     const rid = roomId;
@@ -853,17 +1242,6 @@ export default function Game() {
       targetId: Number.isFinite(parsedTargetId) ? parsedTargetId : null,
     });
   }, [roomId]);
-
-  const submitTurnAction = useCallback((actionType: string, actionData: unknown) => {
-    const rid = roomId;
-    if (!rid) return;
-    const socket = getSocket();
-    socket.emit("turn_action", { roomId: rid, actionType, actionData });
-    toast({
-      title: "행동 제출됨",
-      description: `${actionType} 행동이 턴 종료 시 처리됩니다.`,
-    });
-  }, [roomId, toast]);
 
   const selectedCity = useMemo<CityData | null>(() => {
     if (!selectedTileId) return null;
@@ -987,9 +1365,15 @@ export default function Game() {
       toast({ title: "이동할 병력이 없습니다", variant: "destructive" });
       return;
     }
+    const from = tiles.find((t) => t.id === actionFromTileId) ?? null;
+    const to = tiles.find((t) => t.id === actionTargetTileId) ?? null;
+    const axFrom = from ? from.q + from.r / 2 : 0;
+    const axTo = to ? to.q + to.r / 2 : 0;
+    const facing = axTo < axFrom ? (-1 as const) : (1 as const);
+    setUnitFacingByTileId((prev) => ({ ...prev, [actionTargetTileId]: facing }));
     submitTurnAction("move", { fromTileId: actionFromTileId, toTileId: actionTargetTileId, units: actionUnits });
     setMoveOpen(false);
-  }, [actionFromTileId, actionTargetTileId, actionUnits, submitTurnAction, toast]);
+  }, [actionFromTileId, actionTargetTileId, actionUnits, submitTurnAction, tiles, toast]);
 
   const submitAttack = useCallback(() => {
     if (!actionFromTileId || !actionTargetTileId) return;
@@ -1097,6 +1481,52 @@ export default function Game() {
     },
   };
 
+  const buildingCategoryIcon: Record<typeof buildCategory, string> = {
+    military: textureUrl("건물별아이콘/army0.png"),
+    economy: textureUrl("건물별아이콘/coin0.png"),
+    defense: textureUrl("건물별아이콘/steel0.png"),
+    diplomacy: textureUrl("건물별아이콘/steel0.png"),
+    culture: textureUrl("건물별아이콘/steel0.png"),
+  };
+
+  const buildingListIconByType = useMemo(() => {
+    const m = new Map<BuildingType, string>();
+    const normalize = (s: string) => String(s ?? "").replace(/\s+/g, "").trim();
+    for (const t of Object.keys(BuildingStats) as BuildingType[]) {
+      const nameKo = normalize(BuildingStats[t]?.nameKo ?? "");
+      if (!nameKo) continue;
+
+      let file = "";
+      switch (nameKo) {
+        case "병영": file = "훈련소.png"; break;
+        case "마구간": file = "훈련소.png"; break;
+        case "궁술장": file = "훈련소.png"; break;
+        case "공성공방": file = "무기고.png"; break;
+        case "조선소": file = "항구.png"; break;
+        case "첩보길드": file = "첩보본부.png"; break;
+        case "시장": file = "시장.png"; break;
+        case "은행": file = "국제무역소.png"; break;
+        case "창고": file = "병참기지.png"; break;
+        case "농장": file = "농장.png"; break;
+        case "광산": file = "무기고.png"; break;
+        case "제재소": file = "병참기지.png"; break;
+        case "망루": file = "정찰소.png"; break;
+        case "대사관": file = "외교관저.png"; break;
+        case "정보본부": file = "암호해독국.png"; break;
+        case "궁전": file = "시청.png"; break;
+        case "요새": file = "요새.png"; break;
+        case "성벽": file = "성벽.png"; break;
+        case "기념비": file = "공원극장.png"; break;
+        case "사원": file = "공원극장.png"; break;
+        default:
+          file = `${nameKo}.png`;
+      }
+
+      m.set(t, textureUrl(`건물목록/${file}`));
+    }
+    return m;
+  }, []);
+
   const attackStrategyPresets: Array<{ label: string; text: string }> = [
     { label: "정면 돌격", text: "정면 돌격으로 빠르게 전선을 붕괴시키겠습니다." },
     { label: "방어적 교전", text: "방어적 태세로 손실을 최소화하며 반격 기회를 노리겠습니다." },
@@ -1117,6 +1547,125 @@ export default function Game() {
             timeRemaining={timeRemaining}
             phase={turnPhase}
           />
+
+      <Dialog
+        open={quickMoveDialogOpen}
+        onOpenChange={(open) => {
+          if (!open) {
+            setQuickMoveDialogOpen(false);
+            return;
+          }
+          setQuickMoveDialogOpen(true);
+        }}
+      >
+        <DialogContent className="max-w-md">
+          <DialogHeader>
+            <DialogTitle>빠른 이동</DialogTitle>
+            <DialogDescription>
+              출발 타일: {quickMoveDraftFromTileId ?? "-"} / 확인 후 목적지 타일을 클릭하세요.
+            </DialogDescription>
+          </DialogHeader>
+
+          <div className="space-y-3">
+            <div className="grid grid-cols-2 gap-2">
+              <div className="space-y-1">
+                <div className="text-sm">병과</div>
+                <Select
+                  value={quickMoveDraftUnitType}
+                  onValueChange={(v) => setQuickMoveDraftUnitType(v as UnitType)}
+                >
+                  <SelectTrigger>
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent>
+                    {quickMoveDraftOptions.length > 0 ? (
+                      quickMoveDraftOptions.map((ut) => (
+                        <SelectItem key={ut} value={ut}>
+                          {unitLabels[ut]}
+                        </SelectItem>
+                      ))
+                    ) : (
+                      <SelectItem value={quickMoveDraftUnitType}>
+                        {unitLabels[quickMoveDraftUnitType]}
+                      </SelectItem>
+                    )}
+                  </SelectContent>
+                </Select>
+              </div>
+              <div className="space-y-1">
+                <div className="text-sm">수량 (보유 {quickMoveDraftAvailable.toLocaleString()})</div>
+                <Input
+                  type="number"
+                  min={1}
+                  value={quickMoveDraftAmount}
+                  onChange={(e) => {
+                    const max = Math.max(1, Math.floor(Number(quickMoveDraftAvailable) || 1));
+                    const n = Math.floor(Number(e.target.value) || 1);
+                    setQuickMoveDraftAmount(Math.max(1, Math.min(max, n)));
+                  }}
+                />
+              </div>
+            </div>
+
+            <div className="grid grid-cols-3 gap-2">
+              <Button
+                type="button"
+                variant="secondary"
+                onClick={() => setQuickMoveDraftAmount(Math.max(1, Math.floor(quickMoveDraftAvailable || 1)))}
+                disabled={quickMoveDraftAvailable <= 0}
+              >
+                전체
+              </Button>
+              <Button
+                type="button"
+                variant="secondary"
+                onClick={() => setQuickMoveDraftAmount(Math.max(1, Math.floor((quickMoveDraftAvailable || 1) / 2)))}
+                disabled={quickMoveDraftAvailable <= 1}
+              >
+                절반
+              </Button>
+              <Button
+                type="button"
+                variant="secondary"
+                onClick={() => setQuickMoveDraftAmount(Math.max(1, Math.min(100, Math.floor(quickMoveDraftAvailable || 1))))}
+                disabled={quickMoveDraftAvailable <= 0}
+              >
+                100
+              </Button>
+            </div>
+          </div>
+
+          <DialogFooter>
+            <Button
+              variant="outline"
+              onClick={() => {
+                setQuickMoveDialogOpen(false);
+                setQuickMove(null);
+              }}
+            >
+              취소
+            </Button>
+            <Button
+              disabled={!quickMoveDraftFromTileId || quickMoveDraftAvailable <= 0 || quickMoveDraftAmount <= 0}
+              onClick={() => {
+                if (!quickMoveDraftFromTileId) return;
+                const max = Math.max(0, Math.floor(Number(quickMoveDraftAvailable ?? 0)));
+                if (max <= 0) return;
+                const amt = Math.max(1, Math.min(max, Math.floor(Number(quickMoveDraftAmount) || 1)));
+
+                const units: TroopData = { infantry: 0, cavalry: 0, archer: 0, siege: 0, navy: 0, spy: 0 };
+                (units as any)[quickMoveDraftUnitType] = amt;
+
+                setQuickMove({ fromTileId: quickMoveDraftFromTileId, units });
+                setQuickMoveDialogOpen(false);
+                toast({ title: "이동 모드", description: "목적지 타일을 클릭하면 이동이 제출됩니다." });
+              }}
+            >
+              확인
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
         </div>
 
         <ResourceBar resources={resources} />
@@ -1125,6 +1674,11 @@ export default function Game() {
           <Button variant="ghost" size="icon" data-testid="button-settings">
             <Settings className="w-5 h-5" />
           </Button>
+          {roomHostId != null && currentUser?.id != null && roomHostId === currentUser.id && (
+            <Button variant="ghost" size="icon" data-testid="button-delete-room" onClick={handleDeleteRoom}>
+              <Trash2 className="w-5 h-5" />
+            </Button>
+          )}
           <Button variant="ghost" size="icon" data-testid="button-exit" onClick={handleLeaveRoom}>
             <LogOut className="w-5 h-5" />
           </Button>
@@ -1140,7 +1694,14 @@ export default function Game() {
                 className="flex-1 rounded-none border-b-2 border-transparent data-[state=active]:border-primary"
                 data-testid="tab-map"
               >
-                <MapPin className="w-4 h-4" />
+                <div className="relative">
+                  <MapPin className="w-4 h-4" />
+                  {totalUnreadChat > 0 && (
+                    <Badge className="absolute -top-2 -right-2 h-4 min-w-4 px-1 flex items-center justify-center text-[10px] leading-none">
+                      {totalUnreadChat}
+                    </Badge>
+                  )}
+                </div>
               </TabsTrigger>
               <TabsTrigger
                 value="city"
@@ -1248,7 +1809,7 @@ export default function Game() {
                   players={players.map(p => ({
                     id: String(p.id),
                     oderId: String(p.oderId),
-                    name: p.nationId || "Unknown",
+                    name: p.nationId ? (nationLabelById.get(String(p.nationId)) ?? String(p.nationId)) : "Unknown",
                     avatarUrl: null,
                     isAI: Boolean(p.isAI),
                     aiDifficulty: p.aiDifficulty,
@@ -1264,8 +1825,17 @@ export default function Game() {
                   currentPlayerId={String(currentPlayer?.id ?? "")}
                   onDeclareWar={(id) => handleDiplomacyAction(parseInt(id), "declare_war")}
                   onProposeAlliance={(id) => handleDiplomacyAction(parseInt(id), "propose_alliance")}
-                  onTrade={(id) => console.log("Trade with", id)}
-                  onChat={(id) => console.log("Chat with", id)}
+                  onTrade={(id) => {
+                    const pid = Number(id);
+                    if (!Number.isFinite(pid)) return;
+                    setTradeTargetPlayerId(pid);
+                    setActiveTab("trade");
+                  }}
+                  onChat={(id) => {
+                    const pid = String(id);
+                    if (!pid) return;
+                    setChatFocus({ channel: "private", targetId: pid });
+                  }}
                 />
               </TabsContent>
               <TabsContent value="espionage" className="h-full m-0 p-4">
@@ -1306,6 +1876,7 @@ export default function Game() {
                     spies={spies}
                     myGold={currentPlayer.gold ?? 0}
                     myFood={currentPlayer.food ?? 0}
+                    preselectTargetPlayerId={tradeTargetPlayerId}
                   />
                 ) : (
                   <div className="text-muted-foreground">거래를 사용하려면 플레이어가 필요합니다.</div>
@@ -1324,10 +1895,17 @@ export default function Game() {
               buildings={buildings}
               selectedTileId={selectedTileId}
               onTileClick={handleTileClick}
+              onUnitClick={handleUnitClick}
               playerColor={playerColor}
               currentPlayerId={currentPlayer?.id}
               focusTileId={focusTileId}
-              highlightedTileIds={[autoMoveFromTileId, autoMoveTargetTileId].filter((x): x is number => typeof x === "number")}
+              highlightedTileIds={[
+                ...[autoMoveFromTileId, autoMoveTargetTileId].filter((x): x is number => typeof x === "number"),
+                ...quickMoveReachableTileIds,
+              ]}
+              friendlyPlayerIds={friendlyPlayerIds}
+              atWarPlayerIds={atWarPlayerIds}
+              unitFacingByTileId={unitFacingByTileId}
             />
 
             <div className="absolute left-4 top-4 w-80 bg-card/95 backdrop-blur border rounded-md p-3 space-y-2">
@@ -1348,7 +1926,7 @@ export default function Game() {
                   {selectedCity ? (
                     <div className="space-y-2">
                       <div className="text-xs font-medium text-blue-600">
-                        도시: {selectedCity.name}
+                        도시: {selectedCity.nameKo}
                       </div>
                       <div className="flex gap-2">
                         <Button size="sm" variant="secondary" className="flex-1" onClick={openMove}>
@@ -1407,6 +1985,15 @@ export default function Game() {
                           ))}
                         </SelectContent>
                       </Select>
+                      <Input
+                        type="number"
+                        value={autoMoveAmount}
+                        min={1}
+                        onChange={(e) => setAutoMoveAmount(Math.max(1, Math.floor(Number(e.target.value) || 1)))}
+                      />
+                    </div>
+
+                    <div className="grid grid-cols-2 gap-2">
                       <Button
                         size="sm"
                         variant={autoMoveArmed ? "destructive" : "secondary"}
@@ -1417,6 +2004,12 @@ export default function Game() {
                             setAutoMoveArmed(false);
                             return;
                           }
+                          const maxAvail = Math.max(0, Math.floor(Number(selectedTileTroops[autoMoveUnitType] ?? 0)));
+                          setAutoMoveAmount((prev) => {
+                            const n = Math.floor(Number(prev) || 1);
+                            if (maxAvail > 0) return Math.max(1, Math.min(maxAvail, n));
+                            return Math.max(1, n);
+                          });
                           setAutoMoveFromTileId(selectedTile.id);
                           setAutoMoveTargetTileId(null);
                           setAutoMoveArmed(true);
@@ -1424,6 +2017,9 @@ export default function Game() {
                       >
                         {autoMoveArmed ? "취소" : "출발 선택"}
                       </Button>
+                      <div className="text-xs text-muted-foreground flex items-center">
+                        보유: {Math.floor(Number(selectedTileTroops[autoMoveUnitType] ?? 0)).toLocaleString()}
+                      </div>
                     </div>
 
                     {autoMoveArmed && autoMoveFromTileId != null ? (
@@ -1473,6 +2069,10 @@ export default function Game() {
               currentPlayerId={String(currentPlayer?.id ?? "")}
               players={players}
               onSendMessage={handleSendMessage}
+              focusChannel={chatFocus?.channel ?? null}
+              focusPrivateTargetId={chatFocus?.targetId ?? null}
+              unreadCounts={unreadCounts}
+              onViewChannel={handleViewChatChannel}
             />
           </div>
         </main>
@@ -1890,7 +2490,15 @@ export default function Game() {
                 <TabsList className="w-full justify-start rounded-md">
                   {(Object.keys(buildingCategories) as Array<keyof typeof buildingCategories>).map((k) => (
                     <TabsTrigger key={k} value={k} className="text-xs">
-                      {buildingCategories[k].label}
+                      <span className="inline-flex items-center gap-1">
+                        <img
+                          src={buildingCategoryIcon[k as typeof buildCategory]}
+                          alt=""
+                          className="w-4 h-4"
+                          loading="lazy"
+                        />
+                        {buildingCategories[k].label}
+                      </span>
                     </TabsTrigger>
                   ))}
                 </TabsList>
@@ -1906,7 +2514,15 @@ export default function Game() {
                           className="h-auto py-2 flex flex-col items-start"
                           onClick={() => setBuildBuildingType(t)}
                         >
-                          <div className="text-xs font-medium">{BuildingStats[t].nameKo}</div>
+                          <div className="text-xs font-medium inline-flex items-center gap-2">
+                            <img
+                              src={buildingListIconByType.get(t) ?? ""}
+                              alt=""
+                              className="w-5 h-5"
+                              loading="lazy"
+                            />
+                            {BuildingStats[t].nameKo}
+                          </div>
                           <div className="text-[10px] text-muted-foreground">비용 {BuildingStats[t].buildCost ?? 0}</div>
                         </Button>
                       ))}
@@ -2083,8 +2699,8 @@ export default function Game() {
           </div>
 
           <DialogFooter>
-            <Button variant="outline" onClick={() => setNationSelectOpen(false)}>
-              취소
+            <Button variant="outline" onClick={() => setLocation("/")}>
+              로비로
             </Button>
             <Button
               onClick={handleNationSelect}
@@ -2139,6 +2755,9 @@ export default function Game() {
           )}
 
           <DialogFooter>
+            <Button variant="outline" onClick={() => setLocation("/")}>
+              로비로
+            </Button>
             <Button
               disabled={!selectedCityId || !roomId}
               onClick={async () => {

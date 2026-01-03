@@ -36,6 +36,8 @@ import {
   User,
   Settings,
   Swords,
+  LogIn,
+  LogOut,
 } from "lucide-react";
 import { NationsInitialData } from "@shared/schema";
 import { apiRequest, getQueryFn } from "@/lib/queryClient";
@@ -70,7 +72,6 @@ interface CreateRoomOptions {
   turnDuration: number;
   victoryCondition: string;
   mapMode: string;
-  aiPlayerCount: number;
   aiDifficulty: string;
 }
 
@@ -80,7 +81,6 @@ function CreateRoomDialog({ onCreateRoom }: { onCreateRoom: (room: CreateRoomOpt
   const [mode, setMode] = useState<"ranked" | "casual" | "custom">("casual");
   const [turnDuration, setTurnDuration] = useState<"30" | "45" | "60">("45");
   const [aiDifficulty, setAiDifficulty] = useState<"easy" | "normal" | "hard">("normal");
-  const [aiPlayerCount, setAiPlayerCount] = useState("0");
   const [victoryCondition, setVictoryCondition] = useState<"domination" | "economic" | "diplomatic" | "score">("domination");
   const [mapMode, setMapMode] = useState<"random" | "continents" | "pangaea" | "archipelago">("continents");
   const [open, setOpen] = useState(false);
@@ -92,7 +92,6 @@ function CreateRoomDialog({ onCreateRoom }: { onCreateRoom: (room: CreateRoomOpt
       turnDuration: parseInt(turnDuration),
       victoryCondition,
       mapMode,
-      aiPlayerCount: parseInt(aiPlayerCount),
       aiDifficulty,
     });
     setOpen(false);
@@ -207,24 +206,6 @@ function CreateRoomDialog({ onCreateRoom }: { onCreateRoom: (room: CreateRoomOpt
             </div>
 
             <div className="space-y-2">
-              <Label>AI 플레이어 수</Label>
-              <Select value={aiPlayerCount} onValueChange={setAiPlayerCount}>
-                <SelectTrigger data-testid="select-ai-count">
-                  <SelectValue />
-                </SelectTrigger>
-                <SelectContent>
-                  <SelectItem value="0">없음</SelectItem>
-                  <SelectItem value="2">2명</SelectItem>
-                  <SelectItem value="5">5명</SelectItem>
-                  <SelectItem value="10">10명</SelectItem>
-                  <SelectItem value="15">15명</SelectItem>
-                </SelectContent>
-              </Select>
-            </div>
-          </div>
-
-          {parseInt(aiPlayerCount) > 0 && (
-            <div className="space-y-2">
               <Label>AI 난이도</Label>
               <Select value={aiDifficulty} onValueChange={(v) => setAiDifficulty(v as typeof aiDifficulty)}>
                 <SelectTrigger data-testid="select-ai-difficulty">
@@ -237,7 +218,7 @@ function CreateRoomDialog({ onCreateRoom }: { onCreateRoom: (room: CreateRoomOpt
                 </SelectContent>
               </Select>
             </div>
-          )}
+          </div>
         </div>
 
         <DialogFooter>
@@ -356,6 +337,22 @@ export default function Lobby() {
   const rooms = roomsQuery.data ?? [];
 
   const myUserId = meQuery.data?.user?.id ?? null;
+  const myUsername = meQuery.data?.user?.username ?? null;
+
+  const handleLogout = async () => {
+    try {
+      await apiRequest("POST", "/api/auth/logout", {});
+      await meQuery.refetch();
+      await roomsQuery.refetch();
+      toast({ title: "로그아웃 완료" });
+    } catch (e: any) {
+      toast({
+        title: "로그아웃 실패",
+        description: e?.message || "요청 처리 중 오류가 발생했습니다.",
+        variant: "destructive",
+      });
+    }
+  };
 
   const handleCreateRoom = async (roomData: CreateRoomOptions) => {
     try {
@@ -365,7 +362,6 @@ export default function Lobby() {
         turnDuration: roomData.turnDuration,
         victoryCondition: roomData.victoryCondition,
         mapMode: roomData.mapMode,
-        aiPlayerCount: roomData.aiPlayerCount,
         aiDifficulty: roomData.aiDifficulty,
       });
       const room = (await res.json()) as { id: number };
@@ -431,7 +427,6 @@ export default function Lobby() {
         turnDuration: 30,
         victoryCondition: "domination",
         mapMode: "continents",
-        aiPlayerCount: 3,
         aiDifficulty: "normal",
       });
       const room = (await res.json()) as { id: number };
@@ -459,7 +454,6 @@ export default function Lobby() {
         turnDuration: 15,
         victoryCondition: "domination",
         mapMode: "continents",
-        aiPlayerCount: 8, // AI만 8명
         aiDifficulty: "hard",
       });
       const room = (await res.json()) as { id: number };
@@ -493,15 +487,31 @@ export default function Lobby() {
           </div>
 
           <div className="flex items-center gap-3">
-            <Button variant="outline" size="lg" onClick={handleQuickMatch} data-testid="button-quick-match">
-              <Swords className="w-5 h-5 mr-2" />
-              빠른 대전
-            </Button>
-            <Button variant="outline" size="lg" onClick={handleCreateTestRoom} data-testid="button-test-room">
-              <Bot className="w-5 h-5 mr-2" />
-              AI 테스트 방
-            </Button>
-            <CreateRoomDialog onCreateRoom={handleCreateRoom} />
+            {myUserId ? (
+              <>
+                <Button variant="outline" size="lg" onClick={handleQuickMatch} data-testid="button-quick-match">
+                  <Swords className="w-5 h-5 mr-2" />
+                  빠른 대전
+                </Button>
+                <Button variant="outline" size="lg" onClick={handleCreateTestRoom} data-testid="button-test-room">
+                  <Bot className="w-5 h-5 mr-2" />
+                  AI 테스트 방
+                </Button>
+                <CreateRoomDialog onCreateRoom={handleCreateRoom} />
+                <div className="flex items-center gap-2">
+                  <Badge variant="secondary">{myUsername ?? "-"}</Badge>
+                  <Button variant="outline" size="lg" onClick={handleLogout} data-testid="button-logout">
+                    <LogOut className="w-5 h-5 mr-2" />
+                    로그아웃
+                  </Button>
+                </div>
+              </>
+            ) : (
+              <Button variant="default" size="lg" onClick={() => setLocation("/auth")} data-testid="button-login">
+                <LogIn className="w-5 h-5 mr-2" />
+                로그인
+              </Button>
+            )}
           </div>
         </div>
 
